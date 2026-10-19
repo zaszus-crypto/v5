@@ -19,7 +19,6 @@ Run details
 Annotations
 1 warning and 1 notice
 run-bot
-succeeded 31 minutes ago in 29s
 Search logs
 0s
 1s
