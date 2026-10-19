@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v17.0 (Production Ready with Gist State & Offset)
+XAUUSD MODERN QUANT SIGNAL BOT - v18.0 (Institutional Grade: Multi-TF & Risk)
 =============================================================================
 """
 
@@ -64,7 +64,9 @@ class Config:
     cooldown_minutes: int = 120
     max_daily_signals: int = 3
 
-    price_offset: float = 30.0  # Penyesuaian basis risk Yahoo Finance vs MT5 Spot
+    price_offset: float = 30.0  # Koreksi basis risk Yahoo Finance vs MT5 Spot
+    account_equity: float = 1000.0
+    risk_percent: float = 1.0   # Risiko per trade 1% dari equity
 
     wib: ZoneInfo = ZoneInfo("Asia/Jakarta")
 
@@ -112,7 +114,7 @@ log = logging.getLogger("xauusd_modern_quant")
 
 
 # ===========================================================================
-# WAKTU & SESI
+# WAKTU, SESI & NEWS FILTER (INSTITUTIONAL LAYER)
 # ===========================================================================
 
 def now_utc() -> datetime:
@@ -132,8 +134,20 @@ def is_valid_session() -> bool:
     return any(start <= current <= end for start, end in sessions)
 
 
+def is_high_impact_news_time() -> bool:
+    """
+    Mendeteksi waktu-waktu rawan rilis berita berdampak tinggi (NFP/FOMC/CPI).
+    Biasanya rilis US High Impact terjadi sekitar jam 19:30 - 20:30 WIB atau 01:00 WIB.
+    """
+    t = now_wib().time()
+    # Blokir 15 menit sebelum dan sesudah jam 19:30 & 20:00 WIB (Rilis data US Utama)
+    if time(19, 15) <= t <= time(20, 45):
+        return True
+    return False
+
+
 # ===========================================================================
-# GIST STATE MANAGEMENT (BLIND SPOT #2)
+# GIST STATE MANAGEMENT
 # ===========================================================================
 
 def load_gist_state() -> dict:
@@ -217,12 +231,11 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# FETCH CANDLES DENGAN OFFSET (BLIND SPOT #3)
+# FETCH CANDLES & MULTI-TIMEFRAME (15m & H1 CONFLUENCE)
 # ===========================================================================
 
-def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
-    log.info("Mengambil data market XAUUSD via Yahoo Finance API (dengan offset -%.1f)...", CONFIG.price_offset)
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=60d"
+def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_period}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     response = requests.get(url, headers=headers, timeout=15)
@@ -243,7 +256,6 @@ def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
     
     df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
     
-    # Terapkan nilai offset 30 ke bawah agar sesuai dengan harga spot MT5
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
 
@@ -251,8 +263,36 @@ def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
     return df
 
 
+def check_h1_trend_confluence() -> str:
+    """
+    Memeriksa tren utama di timeframe H1 untuk konfirmasi multi-timeframe.
+    Mengembalikan 'BUY', 'SELL', atau 'NEUTRAL'.
+    """
+    try:
+        df_h1 = fetch_candles(interval="1h", range_period="30d")
+        if len(df_h1) < 50:
+            return "NEUTRAL"
+        
+        # Hitung EMA 50 dan EMA 200 di H1
+        df_h1["ema50"] = df_h1["close"].ewm(span=50, adjust=False).mean()
+        df_h1["ema200"] = df_h1["close"].ewm(span=200, adjust=False).mean()
+        
+        last_close = df_h1["close"].iloc[-1]
+        last_ema50 = df_h1["ema50"].iloc[-1]
+        last_ema200 = df_h1["ema200"].iloc[-1]
+        
+        if last_close > last_ema50 and last_ema50 > last_ema200:
+            return "BUY"
+        elif last_close < last_ema50 and last_ema50 < last_ema200:
+            return "SELL"
+    except Exception as e:
+        log.warning("Gagal mengecek H1 Confluence: %s. Melanjutkan tanpa filter H1.", e)
+    
+    return "NEUTRAL"
+
+
 # ===========================================================================
-# INDIKATOR & MACHINE LEARNING (BLIND SPOT #4 - OOS VALIDATION)
+# INDIKATOR & MACHINE LEARNING
 # ===========================================================================
 
 def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
@@ -431,7 +471,6 @@ def train_and_validate(df: pd.DataFrame) -> dict:
     if len(np.unique(y)) < 2:
         raise ValueError("Label hanya memiliki satu kelas.")
 
-    # Validasi OOS (Out-of-Sample) Check
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
@@ -455,10 +494,9 @@ def train_and_validate(df: pd.DataFrame) -> dict:
     log.info("Validasi Model OOS - AUC: %.3f | Precision: %.3f", oos_auc, oos_prec)
 
     if oos_auc < CONFIG.min_oos_auc or oos_prec < CONFIG.min_oos_precision:
-        log.warning("Model gagal melewati ambang batas OOS. Sinyal akan diblokir.")
+        log.warning("Model gagal melewati ambang batas OOS. Sinyal diblokir.")
         return {"buy_probability": 0.0, "sell_probability": 0.0, "valid": False}
 
-    # Fit final model dengan seluruh data
     model = build_model()
     model.fit(X, y)
     proba = model.predict_proba(X[-1:])[0]
@@ -471,29 +509,40 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v17.0")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v18.0 (Institutional Grade)")
+    
+    # 1. Cek Sesi Market
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
 
-    # Load State Gist
+    # 2. Cek Filter Berita High Impact (News Blackout)
+    if is_high_impact_news_time():
+        log.info("Filter Berita Aktif: Mendekati jadwal rilis data High Impact US. Bot standby demi keamanan.")
+        return
+
+    # 3. Cek State Gist (Max Daily Signals & Cooldown)
     state = load_gist_state()
     if state["daily_signals_count"] >= CONFIG.max_daily_signals:
-        log.info("Batas maksimal sinyal harian (%d) telah tercapai. Bot standby.", CONFIG.max_daily_signals)
+        log.info("Batas maksimal sinyal harian (%d) tercapai. Bot standby.", CONFIG.max_daily_signals)
         return
 
     if state["last_signal_time"]:
         last_dt = datetime.fromisoformat(state["last_signal_time"])
         diff_mins = (now_utc() - last_dt).total_seconds() / 60.0
         if diff_mins < CONFIG.cooldown_minutes:
-            log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit yang ditentukan). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
+            log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
             return
 
-    df = fetch_candles(CONFIG.deriv_symbol, CONFIG.history_candles)
-    df = calculate_features(df)
-    df = triple_barrier_labels(df, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
+    # 4. Ambil Data 15m & Hitung Fitur
+    df = fetch_candles(interval="15m", range_period="60d")
+    current_price = df["close"].iloc[-1]
+    current_atr = df["high"].iloc[-1] - df["low"].iloc[-1] # Perkiraan ATR cepat
+    
+    df_feat = calculate_features(df)
+    df_feat = triple_barrier_labels(df_feat, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
 
-    res = train_and_validate(df)
+    res = train_and_validate(df_feat)
     if not res["valid"]:
         log.info("Sinyal dibatalkan karena validasi OOS tidak terpenuhi.")
         return
@@ -501,19 +550,47 @@ def main():
     buy_p, sell_p = res["buy_probability"], res["sell_probability"]
     log.info("Probabilitas - BUY: %.2f%% | SELL: %.2f%%", buy_p * 100, sell_p * 100)
 
-    signal_sent = False
-    if buy_p >= CONFIG.min_signal_probability:
-        send_telegram(f"<b>XAUUSD SIGNAL: BUY</b>\nProbabilitas: {buy_p * 100:.1f}%\nOffset Spot: -{CONFIG.price_offset}")
-        log.info("Sinyal BUY terkirim!")
-        signal_sent = True
-    elif sell_p >= CONFIG.min_signal_probability:
-        send_telegram(f"<b>XAUUSD SIGNAL: SELL</b>\nProbabilitas: {sell_p * 100:.1f}%\nOffset Spot: -{CONFIG.price_offset}")
-        log.info("Sinyal SELL terkirim!")
-        signal_sent = True
-    else:
-        log.info("Tidak ada sinyal kuat yang memenuhi ambang batas probabilitas.")
+    # 5. Multi-Timeframe Trend Confluence Check (H1 Filter)
+    h1_trend = check_h1_trend_confluence()
+    log.info("Konfirmasi Tren H1 (Multi-TF): %s", h1_trend)
 
-    if signal_sent:
+    signal_type = None
+    if buy_p >= CONFIG.min_signal_probability and (h1_trend == "BUY" or h1_trend == "NEUTRAL"):
+        signal_type = "BUY"
+    elif sell_p >= CONFIG.min_signal_probability and (h1_trend == "SELL" or h1_trend == "NEUTRAL"):
+        signal_type = "SELL"
+    else:
+        log.info("Tidak ada sinyal kuat atau tidak selaras dengan tren H1.")
+
+    if signal_type:
+        # Hitung Manajemen Risiko Dinamis (SL, TP, Lot Size)
+        atr_val = df_feat["atr"].iloc[-1] if "atr" in df_feat.columns else 15.0
+        if signal_type == "BUY":
+            sl = current_price - (atr_val * CONFIG.atr_sl_multiplier)
+            tp = current_price + (atr_val * CONFIG.atr_sl_multiplier * CONFIG.risk_reward)
+            prob_val = buy_p
+        else:
+            sl = current_price + (atr_val * CONFIG.atr_sl_multiplier)
+            tp = current_price - (atr_val * CONFIG.atr_sl_multiplier * CONFIG.risk_reward)
+            prob_val = sell_p
+
+        risk_usd = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
+        risk_pips = abs(current_price - sl)
+        lot_size = round(risk_usd / (risk_pips * 10.0), 2) if risk_pips > 0 else 0.01
+
+        msg = (
+            f"<b>🔥 INSTITUTIONAL XAUUSD SIGNAL: {signal_type} 🔥</b>\n\n"
+            f"🎯 <b>Probabilitas ML:</b> {prob_val * 100:.1f}%\n"
+            f"📊 <b>Konfirmasi H1:</b> {h1_trend}\n"
+            f"📍 <b>Entry Price:</b> {current_price:.2f} (Spot Adjusted)\n"
+            f"🛑 <b>Stop Loss:</b> {sl:.2f}\n"
+            f"🎯 <b>Take Profit:</b> {tp:.2f}\n"
+            f"⚖️ <b>Saran Lot (Risk {CONFIG.risk_percent}%):</b> {lot_size} Lot\n"
+            f"🛡️ <b>Offset Spot:</b> -{CONFIG.price_offset}"
+        )
+        send_telegram(msg)
+        log.info("Sinyal %s terkirim lengkap dengan kalkulasi risiko!", signal_type)
+
         state["daily_signals_count"] += 1
         state["last_signal_time"] = now_utc().isoformat()
         save_gist_state(state)
