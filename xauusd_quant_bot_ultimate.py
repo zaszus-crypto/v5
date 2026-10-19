@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v16.5 (Pure Requests Yahoo API)
+XAUUSD MODERN QUANT SIGNAL BOT - v17.0 (Production Ready with Gist State & Offset)
 =============================================================================
 """
 
@@ -45,7 +45,7 @@ class Config:
     gist_token: str = os.getenv("GH_GIST_TOKEN", "")
     gist_id: str = os.getenv("GH_GIST_ID", "")
 
-    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "GC=F")
+    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "XAUUSD")
     backtest_mode: bool = os.getenv("BACKTEST_MODE", "false").lower() == "true"
 
     timeframe_minutes: int = 15
@@ -58,30 +58,13 @@ class Config:
     risk_reward: float = 2.5
 
     min_signal_probability: float = 0.60
-    min_oos_auc: float = 0.55
-    min_oos_precision: float = 0.50
-    min_expectancy_r: float = 0.05
-
-    atr_regime_min: float = 0.70
-    atr_regime_max: float = 2.20
-    min_adx: float = 18.0
-    max_entropy: float = 0.95
-
-    spread_pips: float = 2.0
-    slippage_pips: float = 0.5
-    pip_value_usd_per_lot: float = 10.0
-
-    account_equity: float = 1000.0
-    risk_percent: float = 0.5
-    contract_size: float = 100.0
+    min_oos_auc: float = 0.52
+    min_oos_precision: float = 0.45
 
     cooldown_minutes: int = 120
     max_daily_signals: int = 3
-    max_daily_loss_usd: float = 25.0
 
-    purge_bars: int = 4
-    embargo_bars: int = 4
-    walk_forward_folds: int = 4
+    price_offset: float = 30.0  # Penyesuaian basis risk Yahoo Finance vs MT5 Spot
 
     wib: ZoneInfo = ZoneInfo("Asia/Jakarta")
 
@@ -150,6 +133,54 @@ def is_valid_session() -> bool:
 
 
 # ===========================================================================
+# GIST STATE MANAGEMENT (BLIND SPOT #2)
+# ===========================================================================
+
+def load_gist_state() -> dict:
+    today_str = now_wib().strftime("%Y-%m-%d")
+    default_state = {
+        "last_signal_time": None,
+        "daily_signals_count": 0,
+        "last_reset_date": today_str
+    }
+    if not CONFIG.gist_token or not CONFIG.gist_id:
+        return default_state
+
+    try:
+        headers = {"Authorization": f"token {CONFIG.gist_token}"}
+        res = requests.get(f"https://api.github.com/gists/{CONFIG.gist_id}", headers=headers, timeout=10)
+        if res.status_code == 200:
+            files = res.json().get("files", {})
+            for fname, fcontent in files.items():
+                if "bot_state.json" in fname or fname == "bot_state.json":
+                    state = json.loads(fcontent["content"])
+                    if state.get("last_reset_date") != today_str:
+                        state["daily_signals_count"] = 0
+                        state["last_reset_date"] = today_str
+                    return state
+    except Exception as e:
+        log.warning("Gagal memuat state dari Gist: %s", e)
+    return default_state
+
+
+def save_gist_state(state: dict):
+    if not CONFIG.gist_token or not CONFIG.gist_id:
+        return
+    try:
+        headers = {"Authorization": f"token {CONFIG.gist_token}"}
+        payload = {
+            "files": {
+                "bot_state.json": {
+                    "content": json.dumps(state, indent=2)
+                }
+            }
+        }
+        requests.patch(f"https://api.github.com/gists/{CONFIG.gist_id}", json=payload, headers=headers, timeout=10)
+    except Exception as e:
+        log.warning("Gagal menyimpan state ke Gist: %s", e)
+
+
+# ===========================================================================
 # TELEGRAM
 # ===========================================================================
 
@@ -186,11 +217,11 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# FETCH CANDLES (YAHOO FINANCE REST API)
+# FETCH CANDLES DENGAN OFFSET (BLIND SPOT #3)
 # ===========================================================================
 
 def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
-    log.info("Mengambil data market XAUUSD via Yahoo Finance API...")
+    log.info("Mengambil data market XAUUSD via Yahoo Finance API (dengan offset -%.1f)...", CONFIG.price_offset)
     url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=60d"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
@@ -211,15 +242,17 @@ def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
     })
     
     df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+    
+    # Terapkan nilai offset 30 ke bawah agar sesuai dengan harga spot MT5
     for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
 
     df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
     return df
 
 
 # ===========================================================================
-# INDIKATOR & MACHINE LEARNING
+# INDIKATOR & MACHINE LEARNING (BLIND SPOT #4 - OOS VALIDATION)
 # ===========================================================================
 
 def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
@@ -398,6 +431,34 @@ def train_and_validate(df: pd.DataFrame) -> dict:
     if len(np.unique(y)) < 2:
         raise ValueError("Label hanya memiliki satu kelas.")
 
+    # Validasi OOS (Out-of-Sample) Check
+    split_idx = int(len(X) * 0.8)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+
+    temp_model = build_model()
+    temp_model.fit(X_train, y_train)
+
+    oos_auc, oos_prec = 0.5, 0.0
+    if len(np.unique(y_test)) >= 2:
+        test_proba = temp_model.predict_proba(X_test)
+        test_preds = temp_model.predict(X_test)
+        try:
+            oos_auc = roc_auc_score(y_test, test_proba, multi_class="ovr")
+        except Exception:
+            pass
+        try:
+            oos_prec = precision_score(y_test, test_preds, average="macro", zero_division=0)
+        except Exception:
+            pass
+
+    log.info("Validasi Model OOS - AUC: %.3f | Precision: %.3f", oos_auc, oos_prec)
+
+    if oos_auc < CONFIG.min_oos_auc or oos_prec < CONFIG.min_oos_precision:
+        log.warning("Model gagal melewati ambang batas OOS. Sinyal akan diblokir.")
+        return {"buy_probability": 0.0, "sell_probability": 0.0, "valid": False}
+
+    # Fit final model dengan seluruh data
     model = build_model()
     model.fit(X, y)
     proba = model.predict_proba(X[-1:])[0]
@@ -405,31 +466,57 @@ def train_and_validate(df: pd.DataFrame) -> dict:
     return {
         "buy_probability": float(proba[2] if len(proba) > 2 else proba[-1]),
         "sell_probability": float(proba[0]),
+        "valid": True
     }
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.5")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v17.0")
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
+
+    # Load State Gist
+    state = load_gist_state()
+    if state["daily_signals_count"] >= CONFIG.max_daily_signals:
+        log.info("Batas maksimal sinyal harian (%d) telah tercapai. Bot standby.", CONFIG.max_daily_signals)
+        return
+
+    if state["last_signal_time"]:
+        last_dt = datetime.fromisoformat(state["last_signal_time"])
+        diff_mins = (now_utc() - last_dt).total_seconds() / 60.0
+        if diff_mins < CONFIG.cooldown_minutes:
+            log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit yang ditentukan). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
+            return
 
     df = fetch_candles(CONFIG.deriv_symbol, CONFIG.history_candles)
     df = calculate_features(df)
     df = triple_barrier_labels(df, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
 
     res = train_and_validate(df)
+    if not res["valid"]:
+        log.info("Sinyal dibatalkan karena validasi OOS tidak terpenuhi.")
+        return
+
     buy_p, sell_p = res["buy_probability"], res["sell_probability"]
     log.info("Probabilitas - BUY: %.2f%% | SELL: %.2f%%", buy_p * 100, sell_p * 100)
 
+    signal_sent = False
     if buy_p >= CONFIG.min_signal_probability:
-        send_telegram(f"<b>XAUUSD SIGNAL: BUY</b>\nProbabilitas: {buy_p * 100:.1f}%")
+        send_telegram(f"<b>XAUUSD SIGNAL: BUY</b>\nProbabilitas: {buy_p * 100:.1f}%\nOffset Spot: -{CONFIG.price_offset}")
         log.info("Sinyal BUY terkirim!")
+        signal_sent = True
     elif sell_p >= CONFIG.min_signal_probability:
-        send_telegram(f"<b>XAUUSD SIGNAL: SELL</b>\nProbabilitas: {sell_p * 100:.1f}%")
+        send_telegram(f"<b>XAUUSD SIGNAL: SELL</b>\nProbabilitas: {sell_p * 100:.1f}%\nOffset Spot: -{CONFIG.price_offset}")
         log.info("Sinyal SELL terkirim!")
+        signal_sent = True
     else:
         log.info("Tidak ada sinyal kuat yang memenuhi ambang batas probabilitas.")
+
+    if signal_sent:
+        state["daily_signals_count"] += 1
+        state["last_signal_time"] = now_utc().isoformat()
+        save_gist_state(state)
 
 
 if __name__ == "__main__":
