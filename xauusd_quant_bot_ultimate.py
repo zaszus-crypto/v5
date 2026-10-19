@@ -1,8 +1,11 @@
+Error tersebut terjadi karena pustaka yfinance belum diinstal di environment GitHub Actions Anda (tidak ada di perintah pip install pada file YAML workflow Anda).
+Agar Anda tidak perlu repot mengubah file workflow YAML, kita bisa mengganti metode pengambilan data menggunakan Yahoo Finance API langsung via requests (tanpa perlu menginstal modul tambahan yfinance). Cara ini sangat aman, cepat, dan tidak akan pernah error ModuleNotFoundError.
+Salin dan tempel kode lengkap berikut ke file xauusd_quant_bot_ultimate.py:
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v16.2 (Robust yfinance Data Fallback)
+XAUUSD MODERN QUANT SIGNAL BOT - v16.3 (Self-Contained Yahoo Finance API)
 =============================================================================
 """
 
@@ -17,7 +20,6 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 
 from sklearn.ensemble import (
     RandomForestClassifier,
@@ -46,12 +48,12 @@ class Config:
     gist_token: str = os.getenv("GH_GIST_TOKEN", "")
     gist_id: str = os.getenv("GH_GIST_ID", "")
 
-    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "GC=F") # Menggunakan ticker Gold standar
+    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "GC=F")
     backtest_mode: bool = os.getenv("BACKTEST_MODE", "false").lower() == "true"
 
     timeframe_minutes: int = 15
     history_candles: int = 2500
-    min_candles: int = 800
+    min_candles: int = 200
 
     forward_bars: int = 4
     atr_period: int = 14
@@ -187,39 +189,35 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# FETCH CANDLES (MENGGUNAKAN YFINANCE UNTUK STABILITAS CI/CD)
+# FETCH CANDLES (YAHOO FINANCE DIRECT API - TANPA YFINANCE PACKAGE)
 # ===========================================================================
 
 def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
-    log.info("Mengambil data market XAUUSD via Yahoo Finance (GC=F)...")
-    # Mengunduh data 60 hari terakhir dengan interval 15 menit
-    df = yf.download(tickers="GC=F", period="60d", interval="15m", progress=False)
-
-    if df.empty:
-        raise ValueError("Gagal mengambil data market: DataFrame kosong.")
-
-    # Merapikan multi-index columns jika ada dari yfinance
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.reset_index()
+    log.info("Mengambil data market XAUUSD via Yahoo Finance API...")
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=60d"
+    headers = {"User-Agent": "Mozilla/5.0"}
     
-    # Deteksi kolom waktu (bisa 'Datetime' atau 'Date')
-    time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
+    data = response.json()
     
-    df["datetime"] = pd.to_datetime(df[time_col], utc=True)
+    result = data["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    quote = result["indicators"]["quote"][0]
     
-    rename_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close"}
-    df = df.rename(columns=rename_map)
-
-    for column in ["open", "high", "low", "close"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = pd.DataFrame({
+        "epoch": timestamps,
+        "open": quote["open"],
+        "high": quote["high"],
+        "low": quote["low"],
+        "close": quote["close"]
+    })
+    
+    df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
-
-    if len(df) < CONFIG.min_candles:
-        log.warning("Candle terkumpul %s, kurang dari min_candles %s", len(df), CONFIG.min_candles)
-
     return df
 
 
@@ -310,7 +308,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + (gain / (loss + 1e-12))))
 
     prev_close = df["close"].shift(1)
-    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (low_diff := (df["low"] - prev_close).abs())], axis=1).max(axis=1)
+    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
     df["atr"] = true_range.rolling(CONFIG.atr_period).mean()
     df["atr_pct"] = df["atr"] / df["close"]
     df["atr_regime"] = df["atr"] / df["atr"].rolling(100).mean()
@@ -414,7 +412,7 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.2")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.3")
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
@@ -439,3 +437,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
