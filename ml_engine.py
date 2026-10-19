@@ -474,4 +474,265 @@ def calculate_market_structure(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_features(df: pd.DataFrame) ->
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / (loss + 1e-12)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    prev_close = df["close"].shift(1)
+    true_range = pd.concat(
+        [df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    df["atr"] = true_range.rolling(CONFIG.atr_period).mean()
+    df["atr_pct"] = df["atr"] / df["close"]
+    df["atr_regime"] = df["atr"] / df["atr"].rolling(100).mean()
+
+    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema_trend"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    df["ema_distance"] = (df["ema_fast"] - df["ema_slow"]) / (df["atr"] + 1e-12)
+    df["ema_slope"] = (df["ema_fast"] - df["ema_fast"].shift(3)) / (df["atr"] + 1e-12)
+    df["trend_strength"] = (df["close"] - df["ema_trend"]) / (df["atr"] + 1e-12)
+
+    kalman_price, kalman_velocity, kalman_error = kalman_filter_1d(
+        df["close"].to_numpy(), q=0.01, r=1.0
+    )
+    df["kalman_price"] = kalman_price
+    df["kalman_trend"] = kalman_velocity / (df["atr"] + 1e-12)
+    df["kalman_error"] = kalman_error
+
+    df = calculate_adx(df, period=14)
+
+    bb_window = 20
+    bb_mean = df["close"].rolling(bb_window).mean()
+    bb_std = df["close"].rolling(bb_window).std()
+    df["bb_position"] = (df["close"] - bb_mean) / (2 * bb_std + 1e-12)
+
+    keltner_mid = df["close"].ewm(span=20, adjust=False).mean()
+    keltner_band = df["atr"].ewm(span=20, adjust=False).mean() * 2
+    df["keltner_position"] = (df["close"] - keltner_mid) / (keltner_band + 1e-12)
+
+    returns = df["close"].pct_change()
+    df["realized_vol"] = returns.rolling(20).std() * np.sqrt(24 * 60 / CONFIG.timeframe_minutes)
+    vol_mean = df["realized_vol"].rolling(100).mean()
+    vol_std = df["realized_vol"].rolling(100).std()
+    df["vol_zscore"] = (df["realized_vol"] - vol_mean) / (vol_std + 1e-12)
+
+    hurst_values = []
+    entropy_values = []
+    close_values = df["close"].to_numpy()
+    return_values = returns.to_numpy()
+    window = 100
+
+    for i in range(len(df)):
+        start = max(0, i - window + 1)
+        hurst_values.append(hurst_exponent(close_values[start:i + 1]))
+        entropy_values.append(shannon_entropy(return_values[start:i + 1]))
+
+    df["hurst"] = hurst_values
+    df["shannon_entropy"] = entropy_values
+
+    df["range"] = df["high"] - df["low"]
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["body_ratio"] = df["body"] / (df["range"] + 1e-12)
+    df["upper_wick_ratio"] = (df["high"] - df[["open", "close"]].max(axis=1)) / (df["range"] + 1e-12)
+    df["lower_wick_ratio"] = (df[["open", "close"]].min(axis=1) - df["low"]) / (df["range"] + 1e-12)
+
+    df = calculate_market_structure(df)
+
+    df["return_1"] = df["close"].pct_change(1)
+    df["return_3"] = df["close"].pct_change(3)
+    df["return_5"] = df["close"].pct_change(5)
+
+    hour = df["datetime"].dt.hour
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    df["dayofweek"] = df["datetime"].dt.dayofweek
+
+    session_values = hour.apply(session_flags)
+    df["session_london"] = session_values.apply(lambda x: int(x[0]))
+    df["session_newyork"] = session_values.apply(lambda x: int(x[1]))
+    df["session_overlap"] = session_values.apply(lambda x: int(x[2]))
+
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+    return df
+
+
+# ===========================================================================
+# TRIPLE-BARRIER LABELING & MODEL
+# ===========================================================================
+
+def triple_barrier_labels(df: pd.DataFrame, forward_bars: int, atr_multiplier: float) -> pd.DataFrame:
+    df = df.copy()
+    labels, exit_bars = [], []
+    close, high, low, atr = df["close"].to_numpy(), df["high"].to_numpy(), df["low"].to_numpy(), df["atr"].to_numpy()
+    n = len(df)
+
+    for i in range(n):
+        if i + forward_bars >= n:
+            labels.append(0)
+            exit_bars.append(0)
+            continue
+
+        entry, atr_value = close[i], atr[i]
+        upper_barrier = entry + atr_value * atr_multiplier
+        lower_barrier = entry - atr_value * atr_multiplier
+        label = 0
+        bars_to_exit = forward_bars
+
+        for j in range(i + 1, min(i + forward_bars + 1, n)):
+            hit_upper = high[j] >= upper_barrier
+            hit_lower = low[j] <= lower_barrier
+
+            if hit_upper and hit_lower:
+                label, bars_to_exit = 0, j - i
+                break
+            if hit_upper:
+                label, bars_to_exit = 1, j - i
+                break
+            if hit_lower:
+                label, bars_to_exit = -1, j - i
+                break
+
+        labels.append(label)
+        exit_bars.append(bars_to_exit)
+
+    df["label"] = labels
+    df["exit_bars"] = exit_bars
+    return df
+
+
+def build_model():
+    rf = RandomForestClassifier(
+        n_estimators=350, max_depth=8, min_samples_leaf=12,
+        max_features="sqrt", class_weight="balanced_subsample", random_state=42, n_jobs=-1
+    )
+    gb = GradientBoostingClassifier(
+        n_estimators=250, max_depth=3, learning_rate=0.025, subsample=0.8, random_state=42
+    )
+    ensemble = VotingClassifier(
+        estimators=[("random_forest", rf), ("gradient_boosting", gb)], voting="soft"
+    )
+    return CalibratedClassifierCV(ensemble, method="isotonic", cv=3)
+
+
+def train_and_validate(df: pd.DataFrame) -> dict:
+    X = df[FEATURES].values
+    y = df["label"].values
+
+    if len(np.unique(y)) < 2:
+        raise ValueError("Label hanya memiliki satu kelas. Perbanyak history.")
+
+    fold_metrics = []
+    oos_true, oos_proba, oos_pred = [], [], []
+    n_samples = len(df)
+    fold_size = n_samples // (CONFIG.walk_forward_folds + 1)
+
+    for fold in range(1, CONFIG.walk_forward_folds + 1):
+        train_end = fold * fold_size - CONFIG.purge_bars
+        test_start = fold * fold_size + CONFIG.embargo_bars
+        test_end = min((fold + 1) * fold_size, n_samples)
+
+        if train_end <= CONFIG.min_candles // 2 or test_start >= test_end:
+            continue
+
+        train_idx = np.arange(0, train_end)
+        test_idx = np.arange(test_start, test_end)
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        if len(np.unique(y_train)) < 2:
+            continue
+
+        model = build_model()
+        model.fit(X_train, y_train)
+
+        y_pred_fold = model.predict(X_test)
+        y_proba_fold = model.predict_proba(X_test)[:, 1]
+
+        metrics = {
+            "accuracy": float(accuracy_score(y_test, y_pred_fold)),
+            "brier": float(brier_score_loss(y_test, y_proba_fold)),
+            "precision": float(precision_score(y_test, y_pred_fold, average="macro", zero_division=0)),
+            "recall": float(recall_score(y_test, y_pred_fold, average="macro", zero_division=0)),
+            "auc": float(roc_auc_score(y_test, y_proba_fold)) if len(np.unique(y_test)) > 1 else 0.5
+        }
+        fold_metrics.append(metrics)
+        oos_true.extend(y_test.tolist())
+        oos_proba.extend(y_proba_fold.tolist())
+        oos_pred.extend(y_pred_fold.tolist())
+
+    if not fold_metrics:
+        raise ValueError("Tidak ada fold walk-forward yang valid.")
+
+    aggregate = {key: float(np.mean([f[key] for f in fold_metrics])) for key in fold_metrics[0]}
+
+    final_model = build_model()
+    final_model.fit(X, y)
+    latest_proba = final_model.predict_proba(X[-1:])[0]
+
+    return {
+        "model": final_model,
+        "buy_probability": float(latest_proba[2]),
+        "sell_probability": float(latest_proba[0]),
+        "oos_accuracy": aggregate["accuracy"],
+        "oos_precision": aggregate["precision"],
+        "oos_auc": aggregate["auc"],
+        "oos_true": np.array(oos_true),
+        "oos_proba": np.array(oos_proba),
+    }
+
+
+# ===========================================================================
+# EKSEKUSI UTAMA
+# ===========================================================================
+
+def main():
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.0")
+    
+    if CONFIG.backtest_mode:
+        log.info("BACKTEST_MODE aktif. Sesi waktu diabaikan.")
+    elif not is_valid_session():
+        log.info("Diluar sesi trading aktif London/New York. Bot standby.")
+        return
+
+    try:
+        df = fetch_candles(CONFIG.deriv_symbol, CONFIG.timeframe_minutes * 60, CONFIG.history_candles)
+        df = calculate_features(df)
+        df = triple_barrier_labels(df, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
+
+        result = train_and_validate(df)
+        log.info("Model berhasil dilatih. Out-of-Sample AUC: %.4f", result["oos_auc"])
+
+        latest = df.iloc[-1]
+        buy_p = result["buy_probability"]
+        sell_p = result["sell_probability"]
+
+        log.info("Probabilitas - BUY: %.2f%% | SELL: %.2f%%", buy_p * 100, sell_p * 100)
+
+        if buy_p >= CONFIG.min_signal_probability:
+            msg = f"<b>XAUUSD SIGNAL: BUY</b>\nProbabilitas: {buy_p * 100:.1f}%\nHarga: {latest['close']}"
+            send_telegram(msg)
+            log.info("Sinyal BUY terkirim!")
+        elif sell_p >= CONFIG.min_signal_probability:
+            msg = f"<b>XAUUSD SIGNAL: SELL</b>\nProbabilitas: {sell_p * 100:.1f}%\nHarga: {latest['close']}"
+            send_telegram(msg)
+            log.info("Sinyal SELL terkirim!")
+        else:
+            log.info("Tidak ada sinyal kuat yang memenuhi ambang batas probabilitas.")
+
+    except Exception as exc:
+        log.error("Pipeline gagal: %s", exc, exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    main()
