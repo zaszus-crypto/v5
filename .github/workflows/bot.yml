@@ -2,9 +2,8 @@ name: XAUUSD Quant Predator Ultimate
 
 on:
   schedule:
-    # Berjalan setiap 1 jam otomatis (Cron UTC)
     - cron: '0 * * * *'
-  workflow_dispatch: Allows manual execution from the GitHub Actions tab.
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -32,4 +31,4 @@ jobs:
           GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
         run: |
-          python bot.py
+          python main.py
