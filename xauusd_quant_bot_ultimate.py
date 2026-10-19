@@ -1,11 +1,11 @@
-Error tersebut terjadi karena pustaka yfinance belum diinstal di environment GitHub Actions Anda (tidak ada di perintah pip install pada file YAML workflow Anda).
-Agar Anda tidak perlu repot mengubah file workflow YAML, kita bisa mengganti metode pengambilan data menggunakan Yahoo Finance API langsung via requests (tanpa perlu menginstal modul tambahan yfinance). Cara ini sangat aman, cepat, dan tidak akan pernah error ModuleNotFoundError.
-Salin dan tempel kode lengkap berikut ke file xauusd_quant_bot_ultimate.py:
+Penyebab error tersebut adalah file xauusd_quant_bot_ultimate.py di repositori Anda masih menyimpan baris import yfinance as yf dari versi sebelumnya, sedangkan environment GitHub Actions Anda tidak menginstal pustaka yfinance.
+Berikut adalah versi terbaru v16.4 yang 100% mandiri (self-contained) menggunakan pustaka standar requests untuk mengambil data dari Yahoo Finance (tanpa memerlukan instalasi paket tambahan yfinance).
+Silakan salin dan timpa (replace) seluruh isi file xauusd_quant_bot_ultimate.py dengan kode di bawah ini:
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v16.3 (Self-Contained Yahoo Finance API)
+XAUUSD MODERN QUANT SIGNAL BOT - v16.4 (Pure Requests Yahoo API)
 =============================================================================
 """
 
@@ -53,7 +53,7 @@ class Config:
 
     timeframe_minutes: int = 15
     history_candles: int = 2500
-    min_candles: int = 200
+    min_candles: int = 100
 
     forward_bars: int = 4
     atr_period: int = 14
@@ -189,13 +189,13 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# FETCH CANDLES (YAHOO FINANCE DIRECT API - TANPA YFINANCE PACKAGE)
+# FETCH CANDLES (YAHOO FINANCE REST API)
 # ===========================================================================
 
 def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
     log.info("Mengambil data market XAUUSD via Yahoo Finance API...")
     url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=60d"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     response = requests.get(url, headers=headers, timeout=15)
     response.raise_for_status()
@@ -412,7 +412,7 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.3")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.4")
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
