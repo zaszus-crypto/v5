@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v22.0 (The Omnipotent Absolute Masterpiece)
+XAUUSD MODERN QUANT SIGNAL BOT - v23.0 (The Ultimate Institutional Masterpiece)
 =============================================================================
 """
 
@@ -28,7 +28,7 @@ from sklearn.metrics import precision_score, roc_auc_score
 
 
 # ===========================================================================
-# KONFIGURASI UTAMA (SUPER STRICT & SAFE)
+# KONFIGURASI UTAMA (ULTIMATE INSTITUTIONAL SPEC)
 # ===========================================================================
 
 @dataclass(frozen=True)
@@ -55,16 +55,19 @@ class Config:
     min_oos_auc: float = 0.52
     min_oos_precision: float = 0.45
 
-    # Regime Guard Thresholds
-    max_entropy_threshold: float = 0.95   # Blokir jika noise pasar terlalu acak
-    min_hurst_threshold: float = 0.40     # Blokir jika tidak ada kejelasan tren
+    # Institutional Guard Thresholds
+    max_entropy_threshold: float = 0.95
+    min_hurst_threshold: float = 0.40
+    max_wick_ratio_threshold: float = 0.70  # Blokir jika sumbu manipulasi > 70%
+    max_trend_age_bars: int = 18            # Cegah exhaustion trap
 
     cooldown_minutes: int = 120
+    choppy_cooldown_minutes: int = 30       # Cooldown khusus saat market choppy
     max_daily_signals: int = 3
 
     price_offset: float = 30.0  # Koreksi basis risk Yahoo Finance vs MT5 Spot
     account_equity: float = 1000.0
-    risk_percent: float = 1.0   # Risiko per trade 1% dari equity
+    risk_percent: float = 1.0   # Risiko dasar per trade
 
     wib: ZoneInfo = ZoneInfo("Asia/Jakarta")
 
@@ -116,13 +119,14 @@ def is_high_impact_news_time() -> bool:
 
 
 # ===========================================================================
-# GIST STATE MANAGEMENT
+# GIST STATE MANAGEMENT (ASYMMETRIC COOLDOWN & PERSISTENCE)
 # ===========================================================================
 
 def load_gist_state() -> dict:
     today_str = now_wib().strftime("%Y-%m-%d")
     default_state = {
         "last_signal_time": None,
+        "last_choppy_time": None,
         "daily_signals_count": 0,
         "last_reset_date": today_str,
         "active_signals": [],
@@ -146,6 +150,7 @@ def load_gist_state() -> dict:
                     if "active_signals" not in state: state["active_signals"] = []
                     if "performance_history" not in state: state["performance_history"] = {"wins": 0, "losses": 0}
                     if "adaptive_threshold" not in state: state["adaptive_threshold"] = CONFIG.base_min_signal_probability
+                    if "last_choppy_time" not in state: state["last_choppy_time"] = None
                     return state
     except Exception as e:
         log.warning("Gagal memuat state dari Gist: %s. Menggunakan default.", e)
@@ -329,7 +334,7 @@ def check_h1_trend_confluence() -> str:
 
 
 # ===========================================================================
-# TECHNICAL FEATURES & REGIME CALCULATIONS
+# TECHNICAL FEATURES & INSTITUTIONAL FILTERS
 # ===========================================================================
 
 def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
@@ -415,7 +420,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + (gain / (loss + 1e-12))))
 
     prev_close = df["close"].shift(1)
-    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
+    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (low_diff := (df["low"] - prev_close)).abs()], axis=1).max(axis=1)
     df["atr"] = true_range.rolling(CONFIG.atr_period).mean()
     df["atr_pct"] = df["atr"] / (df["close"] + 1e-12)
     df["atr_regime"] = df["atr"] / (df["atr"].rolling(100).mean() + 1e-12)
@@ -548,11 +553,11 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 # ===========================================================================
-# MAIN CONTROLLER (OMNIPOTENT FAULT-TOLERANT EXECUTION)
+# MAIN CONTROLLER (THE ULTIMATE MASTERPIECE EXECUTION)
 # ===========================================================================
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v22.0 (Omnipotent Masterpiece)")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v23.0 (Ultimate Institutional Masterpiece)")
     
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
@@ -568,12 +573,23 @@ def main():
         log.info("Batas maksimal sinyal harian (%d) tercapai. Bot standby.", CONFIG.max_daily_signals)
         return
 
+    # Asymmetric Smart Cooldown Check
     if state["last_signal_time"]:
         try:
             last_dt = datetime.fromisoformat(state["last_signal_time"])
             diff_mins = (now_utc() - last_dt).total_seconds() / 60.0
             if diff_mins < CONFIG.cooldown_minutes:
-                log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
+                log.info("Dalam masa cooldown sukses (%.1f menit berlalu dari %d menit). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
+                return
+        except Exception:
+            pass
+
+    if state.get("last_choppy_time"):
+        try:
+            last_choppy_dt = datetime.fromisoformat(state["last_choppy_time"])
+            choppy_diff_mins = (now_utc() - last_choppy_dt).total_seconds() / 60.0
+            if choppy_diff_mins < CONFIG.choppy_cooldown_minutes:
+                log.info("Dalam masa choppy cooldown (%.1f menit berlalu dari %d menit). Menunggu pasar stabil...", choppy_diff_mins, CONFIG.choppy_cooldown_minutes)
                 return
         except Exception:
             pass
@@ -594,13 +610,49 @@ def main():
 
     df_feat = calculate_features(df)
     
-    # --- NOISE & REGIME FILTER (HURST & ENTROPY GUARD) ---
+    # --- 1. REZIM & NOISE GUARD (HURST & ENTROPY) ---
     latest_hurst = df_feat["hurst"].iloc[-2]
     latest_entropy = df_feat["shannon_entropy"].iloc[-2]
     log.info("Analisis Rezim Market - Hurst: %.3f | Shannon Entropy: %.3f", latest_hurst, latest_entropy)
 
     if latest_entropy > CONFIG.max_entropy_threshold or latest_hurst < CONFIG.min_hurst_threshold:
-        log.info("Pasar dalam kondisi acak/choppy (Entropy/Hurst tidak ideal). Sinyal diblokir demi keamanan modal.")
+        log.info("Pasar acak/choppy. Sinyal diblokir. Cooldown dipangkas ke %d menit.", CONFIG.choppy_cooldown_minutes)
+        state["last_choppy_time"] = now_utc().isoformat()
+        save_gist_state(state)
+        return
+
+    # --- 2. ANTI-SPIKE & LIQUIDITY SWEEP WICK GUARD ---
+    latest_high = df["high"].iloc[-2]
+    latest_low = df["low"].iloc[-2]
+    latest_open = df["open"].iloc[-2]
+    latest_close = df["close"].iloc[-2]
+    
+    candle_range = latest_high - latest_low
+    body_range = abs(latest_close - latest_open)
+    wick_ratio = (candle_range - body_range) / (candle_range + 1e-12)
+    
+    log.info("Analisis Wick Candle - Rasio Sumbu: %.1f%%", wick_ratio * 100)
+    if wick_ratio > CONFIG.max_wick_ratio_threshold:
+        log.info("Sumbu candle ekstrem (>70%), terdeteksi potensi manipulasi/fake breakout. Sinyal ditahan.")
+        state["last_choppy_time"] = now_utc().isoformat()
+        save_gist_state(state)
+        return
+
+    # --- 3. MOMENTUM EXHAUSTION FILTER ---
+    ema50_series = df_feat["ema_trend"].to_numpy()
+    close_series = df["close"].to_numpy()
+    trend_age = 0
+    above_ema = close_series[-2] > ema50_series[-2]
+    for idx in range(len(close_series)-2, 0, -1):
+        if (close_series[idx] > ema50_series[idx]) == above_ema:
+            trend_age += 1
+        else:
+            break
+            
+    log.info("Analisis Usia Tren - Durasi: %d bar pada sisi yang sama dengan EMA50", trend_age)
+    if trend_age > CONFIG.max_trend_age_bars:
+        log.info("Tren sudah berjalan terlalu lama (>%d bar). Risiko exhaustion tinggi, sinyal ditahan.", CONFIG.max_trend_age_bars)
+        state["last_choppy_time"] = now_utc().isoformat()
         save_gist_state(state)
         return
 
@@ -637,24 +689,27 @@ def main():
             tp = current_price - (atr_val * CONFIG.atr_sl_multiplier * CONFIG.risk_reward)
             prob_val = sell_p
 
-        risk_usd = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
+        # --- 4. VOLATILITY-ADJUSTED DYNAMIC RISK SIZING ---
+        confidence_factor = prob_val / current_adaptive_threshold
+        dynamic_risk_percent = CONFIG.risk_percent * min(max(confidence_factor, 0.8), 1.5)
+        risk_usd = CONFIG.account_equity * (dynamic_risk_percent / 100.0)
         risk_pips = abs(current_price - sl)
         lot_size = round(risk_usd / (risk_pips * 10.0), 2) if risk_pips > 0 else 0.01
 
         msg = (
-            f"<b>⚡ OMNIPOTENT QUANT SIGNAL: {signal_type} ⚡</b>\n\n"
+            f"<b>🏆 ULTIMATE INSTITUTIONAL SIGNAL: {signal_type} 🏆</b>\n\n"
             f"🕒 <b>Waktu Candle:</b> {analyzed_candle_time}\n"
-            f"🎯 <b>Probabilitas ML:</b> {prob_val * 100:.1f}% (Thresh: {current_adaptive_threshold*100:.0f}%)\n"
+            f"🎯 <b>Probabilitas AI:</b> {prob_val * 100:.1f}% (Thresh: {current_adaptive_threshold*100:.0f}%)\n"
             f"📊 <b>Konfirmasi H1:</b> {h1_trend}\n"
-            f"🌊 <b>Rezim Hurst/Entropy:</b> {latest_hurst:.2f} / {latest_entropy:.2f}\n"
+            f"🌊 <b>Rezim & Wick:</b> Hurst {latest_hurst:.2f} | Wick {wick_ratio*100:.0f}%\n"
             f"📍 <b>Reference Price:</b> {current_price:.2f} (Spot Adjusted)\n"
             f"🛑 <b>Stop Loss:</b> {sl:.2f}\n"
             f"🎯 <b>Take Profit:</b> {tp:.2f}\n"
-            f"⚖️ <b>Saran Lot (Risk {CONFIG.risk_percent}%):</b> {lot_size} Lot\n"
+            f"⚖️ <b>Dynamic Lot (Risk {dynamic_risk_percent:.1f}%):</b> {lot_size} Lot\n"
             f"🛡️ <b>Offset Spot:</b> -{CONFIG.price_offset}"
         )
         send_telegram(msg)
-        log.info("Sinyal %s terkirim dengan perlindungan rezim super sempurna!", signal_type)
+        log.info("Sinyal %s terkirim dengan presisi institusional mutlak!", signal_type)
 
         state["active_signals"].append({
             "type": signal_type,
@@ -666,6 +721,7 @@ def main():
 
         state["daily_signals_count"] += 1
         state["last_signal_time"] = now_utc().isoformat()
+        state["last_choppy_time"] = None # Reset choppy cooldown karena sinyal sukses terkirim
         
     save_gist_state(state)
 
