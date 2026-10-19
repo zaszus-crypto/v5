@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v20.0 (Self-Evolving Autonomous Agent)
+XAUUSD MODERN QUANT SIGNAL BOT - v22.0 (The Omnipotent Absolute Masterpiece)
 =============================================================================
 """
 
@@ -11,7 +11,7 @@ import json
 import time as py_time
 import logging
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -24,17 +24,11 @@ from sklearn.ensemble import (
     VotingClassifier,
 )
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    brier_score_loss,
-)
+from sklearn.metrics import precision_score, roc_auc_score
 
 
 # ===========================================================================
-# KONFIGURASI UTAMA
+# KONFIGURASI UTAMA (SUPER STRICT & SAFE)
 # ===========================================================================
 
 @dataclass(frozen=True)
@@ -61,6 +55,10 @@ class Config:
     min_oos_auc: float = 0.52
     min_oos_precision: float = 0.45
 
+    # Regime Guard Thresholds
+    max_entropy_threshold: float = 0.95   # Blokir jika noise pasar terlalu acak
+    min_hurst_threshold: float = 0.40     # Blokir jika tidak ada kejelasan tren
+
     cooldown_minutes: int = 120
     max_daily_signals: int = 3
 
@@ -74,36 +72,14 @@ class Config:
 CONFIG = Config()
 
 FEATURES = [
-    "rsi",
-    "adx",
-    "di_difference",
-    "ema_distance",
-    "ema_slope",
-    "trend_strength",
-    "kalman_trend",
-    "kalman_error",
-    "atr_pct",
-    "atr_regime",
-    "realized_vol",
-    "vol_zscore",
-    "bb_position",
-    "keltner_position",
-    "hurst",
-    "shannon_entropy",
-    "body_ratio",
-    "upper_wick_ratio",
-    "lower_wick_ratio",
-    "bos_score",
-    "liquidity_sweep_score",
-    "return_1",
-    "return_3",
-    "return_5",
-    "hour_sin",
-    "hour_cos",
-    "dayofweek",
-    "session_london",
-    "session_newyork",
-    "session_overlap",
+    "rsi", "adx", "di_difference", "ema_distance", "ema_slope", 
+    "trend_strength", "kalman_trend", "kalman_error", "atr_pct", 
+    "atr_regime", "realized_vol", "vol_zscore", "bb_position", 
+    "keltner_position", "hurst", "shannon_entropy", "body_ratio", 
+    "upper_wick_ratio", "lower_wick_ratio", "bos_score", 
+    "liquidity_sweep_score", "return_1", "return_3", "return_5", 
+    "hour_sin", "hour_cos", "dayofweek", "session_london", 
+    "session_newyork", "session_overlap"
 ]
 
 logging.basicConfig(
@@ -136,13 +112,11 @@ def is_valid_session() -> bool:
 
 def is_high_impact_news_time() -> bool:
     t = now_wib().time()
-    if time(19, 15) <= t <= time(20, 45):
-        return True
-    return False
+    return time(19, 15) <= t <= time(20, 45)
 
 
 # ===========================================================================
-# GIST STATE MANAGEMENT & SELF-EVOLVING FEEDBACK LOOP
+# GIST STATE MANAGEMENT
 # ===========================================================================
 
 def load_gist_state() -> dict:
@@ -151,7 +125,7 @@ def load_gist_state() -> dict:
         "last_signal_time": None,
         "daily_signals_count": 0,
         "last_reset_date": today_str,
-        "active_signals": [],          # Menyimpan sinyal terbuka untuk dievaluasi
+        "active_signals": [],
         "performance_history": {"wins": 0, "losses": 0},
         "adaptive_threshold": CONFIG.base_min_signal_probability
     }
@@ -169,13 +143,12 @@ def load_gist_state() -> dict:
                     if state.get("last_reset_date") != today_str:
                         state["daily_signals_count"] = 0
                         state["last_reset_date"] = today_str
-                    # Pastikan key adaptif selalu ada
                     if "active_signals" not in state: state["active_signals"] = []
                     if "performance_history" not in state: state["performance_history"] = {"wins": 0, "losses": 0}
                     if "adaptive_threshold" not in state: state["adaptive_threshold"] = CONFIG.base_min_signal_probability
                     return state
     except Exception as e:
-        log.warning("Gagal memuat state dari Gist: %s", e)
+        log.warning("Gagal memuat state dari Gist: %s. Menggunakan default.", e)
     return default_state
 
 
@@ -196,12 +169,7 @@ def save_gist_state(state: dict):
         log.warning("Gagal menyimpan state ke Gist: %s", e)
 
 
-def evaluate_and_adapt_performance(df: pd.DataFrame, state: dict):
-    """
-    Sistem Evolusi Mandiri: Mengevaluasi apakah sinyal aktif sebelumnya 
-    mengenai TP (Win) atau SL (Loss) berdasarkan harga high/low candle terbaru,
-    lalu menyesuaikan adaptive_threshold secara otomatis.
-    """
+def evaluate_and_adapt_performance(df: pd.DataFrame, state: dict) -> dict:
     active_signals = state.get("active_signals", [])
     if not active_signals:
         return state
@@ -218,51 +186,43 @@ def evaluate_and_adapt_performance(df: pd.DataFrame, state: dict):
         tp = sig["tp"]
         sl = sig["sl"]
         
-        # Cek apakah harga terbaru menyentuh TP atau SL
         hit_tp = False
         hit_sl = False
         
         if sig_type == "BUY":
             if np.any(current_highs >= tp): hit_tp = True
             elif np.any(current_lows <= sl): hit_sl = True
-        else: # SELL
+        else:
             if np.any(current_lows <= tp): hit_tp = True
             elif np.any(current_highs >= sl): hit_sl = True
 
         if hit_tp:
             wins += 1
-            log.info("Evolusi Mandiri: Sinyal %s sebelumnya tercatat WIN (Mengenai TP)!", sig_type)
+            log.info("Evolusi Mandiri: Sinyal %s WIN (Mengenai TP)!", sig_type)
         elif hit_sl:
             losses += 1
-            log.info("Evolusi Mandiri: Sinyal %s sebelumnya tercatat LOSS (Mengenai SL)!", sig_type)
+            log.info("Evolusi Mandiri: Sinyal %s LOSS (Mengenai SL)!", sig_type)
         else:
-            # Belum selesai, pertahankan di active signals
             remaining_signals.append(sig)
 
     state["active_signals"] = remaining_signals
     state["performance_history"]["wins"] = wins
     state["performance_history"]["losses"] = losses
 
-    # Hitung Win Rate & Adaptasi Threshold Otomatis
     total_trades = wins + losses
     if total_trades > 0:
         win_rate = wins / total_trades
         current_thresh = state["adaptive_threshold"]
-        
         if win_rate < 0.45 and current_thresh < 0.70:
-            # Performa turun -> Perketat ambang batas probabilitas
             state["adaptive_threshold"] = round(current_thresh + 0.02, 3)
-            log.info("Adaptasi AI: Win rate rendah (%.1f%%). Threshold diperketat menjadi %.2f", win_rate * 100, state["adaptive_threshold"])
         elif win_rate > 0.65 and current_thresh > CONFIG.base_min_signal_probability:
-            # Performa bagus -> Longgarkan sedikit ke batas normal
             state["adaptive_threshold"] = round(current_thresh - 0.01, 3)
-            log.info("Adaptasi AI: Win rate tinggi (%.1f%%). Threshold disesuaikan ke %.2f", win_rate * 100, state["adaptive_threshold"])
 
     return state
 
 
 # ===========================================================================
-# TELEGRAM NOTIFICATION
+# TELEGRAM DISPATCHER
 # ===========================================================================
 
 def send_telegram(message: str) -> bool:
@@ -298,7 +258,7 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# DATA FETCHING & MULTI-TIMEFRAME CONFLUENCE
+# DATA FETCHING & MULTI-TF CONFLUENCE
 # ===========================================================================
 
 def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFrame:
@@ -311,16 +271,23 @@ def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFr
             response.raise_for_status()
             data = response.json()
             
-            result = data["chart"]["result"][0]
-            timestamps = result["timestamp"]
-            quote = result["indicators"]["quote"][0]
+            result = data.get("chart", {}).get("result")
+            if not result:
+                raise ValueError("Struktur respons Yahoo Finance tidak valid.")
+                
+            res_dict = result[0]
+            timestamps = res_dict.get("timestamp", [])
+            quote = res_dict.get("indicators", {}).get("quote", [{}])[0]
             
+            if not timestamps or not quote:
+                raise ValueError("Data timestamp atau quote kosong.")
+
             df = pd.DataFrame({
                 "epoch": timestamps,
-                "open": quote["open"],
-                "high": quote["high"],
-                "low": quote["low"],
-                "close": quote["close"]
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "close": quote.get("close")
             })
             
             df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
@@ -329,6 +296,8 @@ def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFr
                 df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
 
             df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
+            if len(df) < CONFIG.min_candles:
+                raise ValueError(f"Jumlah candle ({len(df)}) kurang dari minimum.")
             return df
         except Exception as e:
             log.warning("Percobaan ke-%d ambil data gagal (%s). Mencoba ulang...", attempt, e)
@@ -356,12 +325,11 @@ def check_h1_trend_confluence() -> str:
             return "SELL"
     except Exception as e:
         log.warning("Gagal mengecek H1 Confluence: %s", e)
-    
     return "NEUTRAL"
 
 
 # ===========================================================================
-# FEATURE ENGINEERING & ML PIPELINE
+# TECHNICAL FEATURES & REGIME CALCULATIONS
 # ===========================================================================
 
 def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
@@ -371,7 +339,7 @@ def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
     for i in range(1, n):
         predicted_estimate = estimate[i - 1] + velocity[i - 1]
         predicted_error = error[i - 1] + q
-        kalman_gain = predicted_error / (predicted_error + r)
+        kalman_gain = predicted_error / (predicted_error + r + 1e-12)
         estimate[i] = predicted_estimate + kalman_gain * (values[i] - predicted_estimate)
         velocity[i] = 0.85 * velocity[i - 1] + 0.15 * (estimate[i] - estimate[i - 1])
         error[i] = (1 - kalman_gain) * predicted_error
@@ -399,7 +367,7 @@ def shannon_entropy(returns: np.ndarray, bins: int = 10) -> float:
     if len(returns) < 20:
         return 1.0
     hist, _ = np.histogram(returns, bins=bins)
-    probabilities = hist / hist.sum()
+    probabilities = hist / (hist.sum() + 1e-12)
     probabilities = probabilities[probabilities > 0]
     entropy = -np.sum(probabilities * np.log2(probabilities))
     max_entropy = np.log2(bins)
@@ -449,8 +417,8 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     prev_close = df["close"].shift(1)
     true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
     df["atr"] = true_range.rolling(CONFIG.atr_period).mean()
-    df["atr_pct"] = df["atr"] / df["close"]
-    df["atr_regime"] = df["atr"] / df["atr"].rolling(100).mean()
+    df["atr_pct"] = df["atr"] / (df["close"] + 1e-12)
+    df["atr_regime"] = df["atr"] / (df["atr"].rolling(100).mean() + 1e-12)
 
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
@@ -579,8 +547,12 @@ def train_and_validate(df: pd.DataFrame) -> dict:
     }
 
 
+# ===========================================================================
+# MAIN CONTROLLER (OMNIPOTENT FAULT-TOLERANT EXECUTION)
+# ===========================================================================
+
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v20.0 (Self-Evolving)")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v22.0 (Omnipotent Masterpiece)")
     
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
@@ -590,7 +562,6 @@ def main():
         log.info("Filter Berita Aktif: Mendekati jadwal rilis data High Impact US. Bot standby.")
         return
 
-    # Load State & Evaluasi Performa Sebelumnya (Self-Evolving Loop)
     state = load_gist_state()
     
     if state["daily_signals_count"] >= CONFIG.max_daily_signals:
@@ -598,16 +569,17 @@ def main():
         return
 
     if state["last_signal_time"]:
-        last_dt = datetime.fromisoformat(state["last_signal_time"])
-        diff_mins = (now_utc() - last_dt).total_seconds() / 60.0
-        if diff_mins < CONFIG.cooldown_minutes:
-            log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
-            return
+        try:
+            last_dt = datetime.fromisoformat(state["last_signal_time"])
+            diff_mins = (now_utc() - last_dt).total_seconds() / 60.0
+            if diff_mins < CONFIG.cooldown_minutes:
+                log.info("Dalam masa cooldown (%.1f menit berlalu dari %d menit). Bot standby.", diff_mins, CONFIG.cooldown_minutes)
+                return
+        except Exception:
+            pass
 
-    # Ambil data market untuk evaluasi performa masa lalu dan kalkulasi baru
     df = fetch_candles(interval="15m", range_period="60d")
     
-    # Jalankan Sistem Evolusi Mandiri (Evaluasi Win/Loss sinyal lalu)
     state = evaluate_and_adapt_performance(df, state)
     current_adaptive_threshold = state.get("adaptive_threshold", CONFIG.base_min_signal_probability)
     
@@ -621,6 +593,17 @@ def main():
              current_adaptive_threshold)
 
     df_feat = calculate_features(df)
+    
+    # --- NOISE & REGIME FILTER (HURST & ENTROPY GUARD) ---
+    latest_hurst = df_feat["hurst"].iloc[-2]
+    latest_entropy = df_feat["shannon_entropy"].iloc[-2]
+    log.info("Analisis Rezim Market - Hurst: %.3f | Shannon Entropy: %.3f", latest_hurst, latest_entropy)
+
+    if latest_entropy > CONFIG.max_entropy_threshold or latest_hurst < CONFIG.min_hurst_threshold:
+        log.info("Pasar dalam kondisi acak/choppy (Entropy/Hurst tidak ideal). Sinyal diblokir demi keamanan modal.")
+        save_gist_state(state)
+        return
+
     df_feat = triple_barrier_labels(df_feat, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
 
     res = train_and_validate(df_feat)
@@ -659,10 +642,11 @@ def main():
         lot_size = round(risk_usd / (risk_pips * 10.0), 2) if risk_pips > 0 else 0.01
 
         msg = (
-            f"<b>🧬 SELF-EVOLVING SIGNAL: {signal_type} 🧬</b>\n\n"
+            f"<b>⚡ OMNIPOTENT QUANT SIGNAL: {signal_type} ⚡</b>\n\n"
             f"🕒 <b>Waktu Candle:</b> {analyzed_candle_time}\n"
             f"🎯 <b>Probabilitas ML:</b> {prob_val * 100:.1f}% (Thresh: {current_adaptive_threshold*100:.0f}%)\n"
             f"📊 <b>Konfirmasi H1:</b> {h1_trend}\n"
+            f"🌊 <b>Rezim Hurst/Entropy:</b> {latest_hurst:.2f} / {latest_entropy:.2f}\n"
             f"📍 <b>Reference Price:</b> {current_price:.2f} (Spot Adjusted)\n"
             f"🛑 <b>Stop Loss:</b> {sl:.2f}\n"
             f"🎯 <b>Take Profit:</b> {tp:.2f}\n"
@@ -670,9 +654,8 @@ def main():
             f"🛡️ <b>Offset Spot:</b> -{CONFIG.price_offset}"
         )
         send_telegram(msg)
-        log.info("Sinyal %s terkirim dengan Adaptive Feedback Loop!", signal_type)
+        log.info("Sinyal %s terkirim dengan perlindungan rezim super sempurna!", signal_type)
 
-        # Catat sinyal baru ke active_signals untuk dievaluasi pada run berikutnya
         state["active_signals"].append({
             "type": signal_type,
             "entry": current_price,
@@ -684,9 +667,11 @@ def main():
         state["daily_signals_count"] += 1
         state["last_signal_time"] = now_utc().isoformat()
         
-    # Simpan kembali state terbaru (termasuk hasil evolusi win/loss) ke Gist
     save_gist_state(state)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.critical("Gagal mengeksekusi skrip: %s", e, exc_info=True)
