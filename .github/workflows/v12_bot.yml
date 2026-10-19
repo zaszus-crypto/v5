@@ -32,4 +32,4 @@ jobs:
           GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
         run: |
-          python main12.py
+          python main.py
