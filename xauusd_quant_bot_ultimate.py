@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v18.0 (Institutional Grade: Multi-TF & Risk)
+XAUUSD MODERN QUANT SIGNAL BOT - v19.0 (The Ultimate Masterpiece)
 =============================================================================
 """
 
@@ -34,7 +34,7 @@ from sklearn.metrics import (
 
 
 # ===========================================================================
-# KONFIGURASI
+# KONFIGURASI UTAMA
 # ===========================================================================
 
 @dataclass(frozen=True)
@@ -114,7 +114,7 @@ log = logging.getLogger("xauusd_modern_quant")
 
 
 # ===========================================================================
-# WAKTU, SESI & NEWS FILTER (INSTITUTIONAL LAYER)
+# WAKTU, SESI & FILTER BERITA
 # ===========================================================================
 
 def now_utc() -> datetime:
@@ -135,19 +135,15 @@ def is_valid_session() -> bool:
 
 
 def is_high_impact_news_time() -> bool:
-    """
-    Mendeteksi waktu-waktu rawan rilis berita berdampak tinggi (NFP/FOMC/CPI).
-    Biasanya rilis US High Impact terjadi sekitar jam 19:30 - 20:30 WIB atau 01:00 WIB.
-    """
+    """Filter ketat rilis data US High Impact (NFP/FOMC/CPI)."""
     t = now_wib().time()
-    # Blokir 15 menit sebelum dan sesudah jam 19:30 & 20:00 WIB (Rilis data US Utama)
     if time(19, 15) <= t <= time(20, 45):
         return True
     return False
 
 
 # ===========================================================================
-# GIST STATE MANAGEMENT
+# GIST STATE MANAGEMENT (STATE PERSISTENCE)
 # ===========================================================================
 
 def load_gist_state() -> dict:
@@ -195,7 +191,7 @@ def save_gist_state(state: dict):
 
 
 # ===========================================================================
-# TELEGRAM
+# TELEGRAM NOTIFICATION
 # ===========================================================================
 
 def send_telegram(message: str) -> bool:
@@ -231,55 +227,59 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# FETCH CANDLES & MULTI-TIMEFRAME (15m & H1 CONFLUENCE)
+# DATA FETCHING & ROBUST ERROR RETRY
 # ===========================================================================
 
 def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFrame:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_period}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
-    response = requests.get(url, headers=headers, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    
-    result = data["chart"]["result"][0]
-    timestamps = result["timestamp"]
-    quote = result["indicators"]["quote"][0]
-    
-    df = pd.DataFrame({
-        "epoch": timestamps,
-        "open": quote["open"],
-        "high": quote["high"],
-        "low": quote["low"],
-        "close": quote["close"]
-    })
-    
-    df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
-    
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            result = data["chart"]["result"][0]
+            timestamps = result["timestamp"]
+            quote = result["indicators"]["quote"][0]
+            
+            df = pd.DataFrame({
+                "epoch": timestamps,
+                "open": quote["open"],
+                "high": quote["high"],
+                "low": quote["low"],
+                "close": quote["close"]
+            })
+            
+            df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+            
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
 
-    df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
-    return df
+            df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
+            return df
+        except Exception as e:
+            log.warning("Percobaan ke-%d ambil data gagal (%s). Mencoba ulang...", attempt, e)
+            py_time.sleep(2 * attempt)
+            
+    raise RuntimeError("Gagal total mengambil data market dari Yahoo Finance API setelah 3 kali percobaan.")
 
 
 def check_h1_trend_confluence() -> str:
-    """
-    Memeriksa tren utama di timeframe H1 untuk konfirmasi multi-timeframe.
-    Mengembalikan 'BUY', 'SELL', atau 'NEUTRAL'.
-    """
+    """Multi-Timeframe H1 Trend Confluence Filter."""
     try:
         df_h1 = fetch_candles(interval="1h", range_period="30d")
         if len(df_h1) < 50:
             return "NEUTRAL"
         
-        # Hitung EMA 50 dan EMA 200 di H1
+        # Evaluasi candle H1 terakhir yang sudah tertutup (index -2)
         df_h1["ema50"] = df_h1["close"].ewm(span=50, adjust=False).mean()
         df_h1["ema200"] = df_h1["close"].ewm(span=200, adjust=False).mean()
         
-        last_close = df_h1["close"].iloc[-1]
-        last_ema50 = df_h1["ema50"].iloc[-1]
-        last_ema200 = df_h1["ema200"].iloc[-1]
+        last_close = df_h1["close"].iloc[-2]
+        last_ema50 = df_h1["ema50"].iloc[-2]
+        last_ema200 = df_h1["ema200"].iloc[-2]
         
         if last_close > last_ema50 and last_ema50 > last_ema200:
             return "BUY"
@@ -292,7 +292,7 @@ def check_h1_trend_confluence() -> str:
 
 
 # ===========================================================================
-# INDIKATOR & MACHINE LEARNING
+# FEATURE ENGINEERING & ML PIPELINE
 # ===========================================================================
 
 def kalman_filter_1d(values: np.ndarray, q: float = 0.01, r: float = 1.0):
@@ -499,7 +499,11 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
     model = build_model()
     model.fit(X, y)
-    proba = model.predict_proba(X[-1:])[0]
+    
+    # KUNCI UTAMA KESEMPURNAAN: Evaluasi pada CANDLE TERAKHIR YANG SUDAH TUTUP (index -2) 
+    # untuk menghindari repainting & kebal terhadap keterlambatan cron GitHub Actions.
+    target_X = X[-2: -1] 
+    proba = model.predict_proba(target_X)[0]
 
     return {
         "buy_probability": float(proba[2] if len(proba) > 2 else proba[-1]),
@@ -509,14 +513,14 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v18.0 (Institutional Grade)")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v19.0 (Ultimate Masterpiece)")
     
     # 1. Cek Sesi Market
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
 
-    # 2. Cek Filter Berita High Impact (News Blackout)
+    # 2. Cek Filter Berita High Impact
     if is_high_impact_news_time():
         log.info("Filter Berita Aktif: Mendekati jadwal rilis data High Impact US. Bot standby demi keamanan.")
         return
@@ -536,9 +540,13 @@ def main():
 
     # 4. Ambil Data 15m & Hitung Fitur
     df = fetch_candles(interval="15m", range_period="60d")
-    current_price = df["close"].iloc[-1]
-    current_atr = df["high"].iloc[-1] - df["low"].iloc[-1] # Perkiraan ATR cepat
     
+    # Catat waktu candle tertutup yang dianalisis (index -2 adalah candle closed terakhir)
+    analyzed_candle_time = df["datetime"].iloc[-2].astimezone(CONFIG.wib).strftime("%Y-%m-%d %H:%M WIB")
+    current_price = df["close"].iloc[-2]
+    
+    log.info("Menganalisis Candle Closed Terakhir: %s (Harga Close: %.2f)", analyzed_candle_time, current_price)
+
     df_feat = calculate_features(df)
     df_feat = triple_barrier_labels(df_feat, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
 
@@ -564,7 +572,7 @@ def main():
 
     if signal_type:
         # Hitung Manajemen Risiko Dinamis (SL, TP, Lot Size)
-        atr_val = df_feat["atr"].iloc[-1] if "atr" in df_feat.columns else 15.0
+        atr_val = df_feat["atr"].iloc[-2] if "atr" in df_feat.columns else 15.0
         if signal_type == "BUY":
             sl = current_price - (atr_val * CONFIG.atr_sl_multiplier)
             tp = current_price + (atr_val * CONFIG.atr_sl_multiplier * CONFIG.risk_reward)
@@ -579,17 +587,18 @@ def main():
         lot_size = round(risk_usd / (risk_pips * 10.0), 2) if risk_pips > 0 else 0.01
 
         msg = (
-            f"<b>🔥 INSTITUTIONAL XAUUSD SIGNAL: {signal_type} 🔥</b>\n\n"
+            f"<b>🔥 MASTERPIECE XAUUSD SIGNAL: {signal_type} 🔥</b>\n\n"
+            f"🕒 <b>Waktu Candle:</b> {analyzed_candle_time}\n"
             f"🎯 <b>Probabilitas ML:</b> {prob_val * 100:.1f}%\n"
             f"📊 <b>Konfirmasi H1:</b> {h1_trend}\n"
-            f"📍 <b>Entry Price:</b> {current_price:.2f} (Spot Adjusted)\n"
+            f"📍 <b>Reference Price:</b> {current_price:.2f} (Spot Adjusted)\n"
             f"🛑 <b>Stop Loss:</b> {sl:.2f}\n"
             f"🎯 <b>Take Profit:</b> {tp:.2f}\n"
             f"⚖️ <b>Saran Lot (Risk {CONFIG.risk_percent}%):</b> {lot_size} Lot\n"
             f"🛡️ <b>Offset Spot:</b> -{CONFIG.price_offset}"
         )
         send_telegram(msg)
-        log.info("Sinyal %s terkirim lengkap dengan kalkulasi risiko!", signal_type)
+        log.info("Sinyal %s terkirim dengan presisi Closed-Bar!", signal_type)
 
         state["daily_signals_count"] += 1
         state["last_signal_time"] = now_utc().isoformat()
