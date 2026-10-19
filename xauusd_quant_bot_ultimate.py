@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v16.1 (Fix Time Module Conflict)
+XAUUSD MODERN QUANT SIGNAL BOT - v16.2 (Robust yfinance Data Fallback)
 =============================================================================
 """
 
@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import requests
-import websocket
+import yfinance as yf
 
 from sklearn.ensemble import (
     RandomForestClassifier,
@@ -46,8 +46,7 @@ class Config:
     gist_token: str = os.getenv("GH_GIST_TOKEN", "")
     gist_id: str = os.getenv("GH_GIST_ID", "")
 
-    deriv_app_id: str = os.getenv("DERIV_APP_ID", "1089")
-    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "XAUUSD")
+    deriv_symbol: str = os.getenv("DERIV_SYMBOL", "GC=F") # Menggunakan ticker Gold standar
     backtest_mode: bool = os.getenv("BACKTEST_MODE", "false").lower() == "true"
 
     timeframe_minutes: int = 15
@@ -89,10 +88,6 @@ class Config:
 
 
 CONFIG = Config()
-
-DERIV_WS_URL = (
-    f"wss://ws.derivws.com/websockets/v3?app_id={CONFIG.deriv_app_id}"
-)
 
 FEATURES = [
     "rsi",
@@ -146,13 +141,6 @@ def now_wib() -> datetime:
     return now_utc().astimezone(CONFIG.wib)
 
 
-def session_flags(hour_utc: int) -> tuple[bool, bool, bool]:
-    london = 7 <= hour_utc < 16
-    new_york = 12 <= hour_utc < 21
-    overlap = 12 <= hour_utc < 16
-    return london, new_york, overlap
-
-
 def is_valid_session() -> bool:
     current = now_wib().time()
     sessions = [
@@ -163,7 +151,7 @@ def is_valid_session() -> bool:
 
 
 # ===========================================================================
-# TELEGRAM & GIST
+# TELEGRAM
 # ===========================================================================
 
 def send_telegram(message: str) -> bool:
@@ -199,53 +187,40 @@ def send_telegram(message: str) -> bool:
 
 
 # ===========================================================================
-# DERIV PUBLIC DATA
+# FETCH CANDLES (MENGGUNAKAN YFINANCE UNTUK STABILITAS CI/CD)
 # ===========================================================================
 
-def deriv_request(payload: dict, timeout: int = 20, max_retries: int = 4) -> dict:
-    for attempt in range(1, max_retries + 1):
-        try:
-            ws = websocket.create_connection(
-                DERIV_WS_URL, 
-                timeout=timeout,
-                header={"User-Agent": "Mozilla/5.0 (Compatible; XAUUSDQuantBot/16.1)"}
-            )
-            ws.send(json.dumps(payload))
-            response_raw = ws.recv()
-            ws.close()
+def fetch_candles(symbol: str, count: int) -> pd.DataFrame:
+    log.info("Mengambil data market XAUUSD via Yahoo Finance (GC=F)...")
+    # Mengunduh data 60 hari terakhir dengan interval 15 menit
+    df = yf.download(tickers="GC=F", period="60d", interval="15m", progress=False)
 
-            response = json.loads(response_raw)
-            if "error" in response:
-                error = response["error"]
-                raise RuntimeError(f"Deriv error [{error.get('code')}]: {error.get('message')}")
-            return response
+    if df.empty:
+        raise ValueError("Gagal mengambil data market: DataFrame kosong.")
 
-        except Exception as exc:
-            log.warning("Koneksi Deriv gagal (Attempt %s/%s): %s", attempt, max_retries, exc)
-            if attempt == max_retries:
-                raise RuntimeError(f"Gagal terhubung ke Deriv API setelah {max_retries} percobaan: {exc}")
-            py_time.sleep(3 * attempt)
+    # Merapikan multi-index columns jika ada dari yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-
-def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFrame:
-    response = deriv_request({
-        "ticks_history": symbol,
-        "style": "candles",
-        "granularity": granularity,
-        "count": count,
-        "end": "latest",
-        "adjust_start_time": 1,
-        "req_id": 2,
-    })
-    candles = response.get("candles", [])
-    if len(candles) < CONFIG.min_candles:
-        raise ValueError(f"Candle tidak cukup: {len(candles)} < {CONFIG.min_candles}")
+    df = df.reset_index()
     
-    df = pd.DataFrame(candles)
-    df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
+    # Deteksi kolom waktu (bisa 'Datetime' atau 'Date')
+    time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
+    
+    df["datetime"] = pd.to_datetime(df[time_col], utc=True)
+    
+    rename_map = {"Open": "open", "High": "high", "Low": "low", "Close": "close"}
+    df = df.rename(columns=rename_map)
+
     for column in ["open", "high", "low", "close"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
-    return df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
+
+    df = df[["datetime", "open", "high", "low", "close"]].dropna().sort_values("datetime").reset_index(drop=True)
+
+    if len(df) < CONFIG.min_candles:
+        log.warning("Candle terkumpul %s, kurang dari min_candles %s", len(df), CONFIG.min_candles)
+
+    return df
 
 
 # ===========================================================================
@@ -335,7 +310,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = 100 - (100 / (1 + (gain / (loss + 1e-12))))
 
     prev_close = df["close"].shift(1)
-    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
+    true_range = pd.concat([df["high"] - df["low"], (df["high"] - prev_close).abs(), (low_diff := (df["low"] - prev_close).abs())], axis=1).max(axis=1)
     df["atr"] = true_range.rolling(CONFIG.atr_period).mean()
     df["atr_pct"] = df["atr"] / df["close"]
     df["atr_regime"] = df["atr"] / df["atr"].rolling(100).mean()
@@ -439,12 +414,12 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.1")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.2")
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
 
-    df = fetch_candles(CONFIG.deriv_symbol, CONFIG.timeframe_minutes * 60, CONFIG.history_candles)
+    df = fetch_candles(CONFIG.deriv_symbol, CONFIG.history_candles)
     df = calculate_features(df)
     df = triple_barrier_labels(df, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
 
