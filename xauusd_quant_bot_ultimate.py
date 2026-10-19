@@ -1,11 +1,8 @@
-Penyebab error tersebut adalah file xauusd_quant_bot_ultimate.py di repositori Anda masih menyimpan baris import yfinance as yf dari versi sebelumnya, sedangkan environment GitHub Actions Anda tidak menginstal pustaka yfinance.
-Berikut adalah versi terbaru v16.4 yang 100% mandiri (self-contained) menggunakan pustaka standar requests untuk mengambil data dari Yahoo Finance (tanpa memerlukan instalasi paket tambahan yfinance).
-Silakan salin dan timpa (replace) seluruh isi file xauusd_quant_bot_ultimate.py dengan kode di bawah ini:
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 =============================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v16.4 (Pure Requests Yahoo API)
+XAUUSD MODERN QUANT SIGNAL BOT - v16.5 (Pure Requests Yahoo API)
 =============================================================================
 """
 
@@ -412,7 +409,7 @@ def train_and_validate(df: pd.DataFrame) -> dict:
 
 
 def main():
-    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.4")
+    log.info("Menjalankan XAUUSD Modern Quant Signal Bot v16.5")
     if not CONFIG.backtest_mode and not is_valid_session():
         log.info("Diluar sesi trading aktif London/New York. Bot standby.")
         return
@@ -437,4 +434,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
