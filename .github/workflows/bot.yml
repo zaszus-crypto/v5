@@ -1,0 +1,88 @@
+name: XAUUSD Quant Bot v25
+
+on:
+  # Live signals — Mon-Fri, jam aktif London + NY (UTC)
+  # London: 06:00-10:00 UTC (13:00-17:00 WIB)
+  # NY    : 12:00-16:00 UTC (19:00-23:00 WIB)
+  schedule:
+    - cron: '*/15 6-9,12-15 * * 1-5'
+  
+  # Manual trigger (backtest / live test)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'live'
+        type: choice
+        options:
+          - live
+          - backtest
+      days:
+        description: 'Backtest days (60 / 90 / 120)'
+        required: false
+        default: '60'
+      equity:
+        description: 'Backtest initial equity (USD)'
+        required: false
+        default: '10000'
+
+# Live & backtest tidak saling memblokir
+concurrency:
+  group: xauusd-${{ github.event.inputs.mode || 'live' }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore model cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/model.pkl
+          key: xauusd-model-${{ github.run_id }}
+          restore-keys: |
+            xauusd-model-
+
+      - name: Ensure cache dir
+        run: mkdir -p .cache
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+          MODEL_CACHE_PATH: ${{ github.workspace }}/.cache/model.pkl
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "backtest" ]; then
+            python bot.py \
+              --backtest \
+              --days "${{ github.event.inputs.days || '60' }}" \
+              --equity "${{ github.event.inputs.equity || '10000' }}"
+          else
+            python bot.py
+          fi
+
+      - name: Save model cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/model.pkl
+          key: xauusd-model-${{ github.run_id }}
