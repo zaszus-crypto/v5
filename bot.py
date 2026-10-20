@@ -127,8 +127,12 @@ FEATURES = [
 
 SESSION_EMOJI = {"LONDON": "🇬🇧", "NEWYORK": "🇺🇸", "ASIAN": "🌏", "LATE": "🌙"}
 
-logging.basicConfig(level=logging.INFO,
-                     format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stderr,
+    force=True,
+)
 log = logging.getLogger("xauusd_v254")
 
 
