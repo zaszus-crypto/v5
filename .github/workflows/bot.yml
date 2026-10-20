@@ -1,17 +1,18 @@
-name: XAUUSD Bot v25.1
+name: XAUUSD Bot v25.2
 
 on:
+  # Cron utama: setiap 30 menit, Senin-Jumat (WIB = UTC+7)
+  # Bot jalan di setiap tick; monitor hanya aktif saat jam 08:00 WIB (01:00 UTC)
   schedule:
-    # 30-min cron untuk private repo (aman 2000 min/bulan)
-    # Ganti ke '*/15 * * * 1-5' kalau public repo
     - cron: '*/30 * * * 1-5'
+
   workflow_dispatch:
     inputs:
       mode:
         required: true
         default: 'live'
         type: choice
-        options: [live, backtest]
+        options: [live, backtest, monitor, monitor-dry-run]
       days:
         required: false
         default: '60'
@@ -27,19 +28,54 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions: { contents: read }
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11', cache: 'pip' }
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
       - run: pip install -r requirements.txt
+
       - uses: actions/cache/restore@v4
         with:
           path: .cache/model.pkl
-          key: xauusd-v251-${{ github.run_id }}
-          restore-keys: xauusd-v251-
+          key: xauusd-v252-${{ github.run_id }}
+          restore-keys: xauusd-v252-
+
       - run: mkdir -p .cache
+
+      # === STEP 1: Bot signal ===
       - name: Run bot
+        if: |
+          github.event_name == 'schedule' ||
+          github.event.inputs.mode == 'live'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+          MODEL_CACHE_PATH: ${{ github.workspace }}/.cache/model.pkl
+        run: python bot.py
+
+      # === STEP 2: Monitor check (runs even if bot failed) ===
+      - name: Monitor check
+        if: |
+          always() &&
+          (github.event_name == 'schedule' || github.event.inputs.mode == 'live')
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+        run: python bot.py --monitor-check
+
+      # === Manual modes ===
+      - name: Backtest
+        if: github.event.inputs.mode == 'backtest'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -47,13 +83,29 @@ jobs:
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
           MODEL_CACHE_PATH: ${{ github.workspace }}/.cache/model.pkl
         run: |
-          if [ "${{ github.event.inputs.mode }}" = "backtest" ]; then
-            python bot.py --backtest --days "${{ github.event.inputs.days || '60' }}" --equity "${{ github.event.inputs.equity || '10000' }}"
-          else
-            python bot.py
-          fi
+          python bot.py --backtest \
+            --days "${{ github.event.inputs.days || '60' }}" \
+            --equity "${{ github.event.inputs.equity || '10000' }}"
+
+      - name: Monitor (force)
+        if: github.event.inputs.mode == 'monitor'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+        run: python bot.py --monitor
+
+      - name: Monitor (dry-run)
+        if: github.event.inputs.mode == 'monitor-dry-run'
+        env:
+          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+        run: python bot.py --monitor-dry-run
+
+      # === Cache save ===
       - uses: actions/cache/save@v4
         if: always()
         with:
           path: .cache/model.pkl
-          key: xauusd-v251-${{ github.run_id }}
+          key: xauusd-v252-${{ github.run_id }}
