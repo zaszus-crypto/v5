@@ -1435,10 +1435,12 @@ def main():
                 if mins < get_session_cooldown():
                     log.info("Cooldown (%.0f).", mins); return
             except Exception: pass
-        if state.get("last_choppy_time"):
+               if state.get("last_choppy_time"):
             try:
                 mins = (now_utc() - datetime.fromisoformat(state["last_choppy_time"])).total_seconds()/60
-                if mins < CONFIG.choppy_cooldown_minutes: return
+                if mins < CONFIG.choppy_cooldown_minutes:
+                    log.info("Choppy cooldown (%.0f/%d min).", mins, CONFIG.choppy_cooldown_minutes)
+                    return
             except Exception: pass
         if is_high_impact_news_time():
             log.info("News window."); return
