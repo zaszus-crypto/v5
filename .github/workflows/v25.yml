@@ -2,7 +2,7 @@ name: XAUUSD Bot v25.5 Runner
 
 on:
   schedule:
-    # Berjalan setiap 15 menit (Senin - Jumat) di sesi market Forex aktif
+    # Berjalan setiap 15 menit (Senin - Jumat) mencakup seluruh sesi market London, NY, Asia
     - cron: "*/15 * * * 1-5"
   workflow_dispatch:
     inputs:
