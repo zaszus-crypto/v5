@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-================================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v25.3 (Multi-Source Spot Hardened)
-================================================================================
+XAUUSD BOT v25.4 — PAXG Multi-Source Live Edition
 Modes:
-    python bot.py                        # Live bot signal
-    python bot.py --backtest [--days N] [--equity X]
-    python bot.py --monitor              # Force daily+weekly report
-    python bot.py --monitor-check        # Send report if due
-    python bot.py --monitor-dry-run      # Print report only
-    python bot.py --test-sources         # Test data sources
-    python bot.py --audit-features       # Feature importance
-    python bot.py --healthcheck          # Watchdog (every 6h)
-================================================================================
+  python bot.py                    # live signal
+  python bot.py --backtest         # backtest 60d
+  python bot.py --monitor          # force daily report
+  python bot.py --monitor-check    # send if due
+  python bot.py --monitor-dry-run  # preview report
+  python bot.py --healthcheck      # watchdog
+  python bot.py --audit-features   # feature importance
+  python bot.py --test-sources     # test data sources
 """
 
 import os, sys, json, pickle, logging, argparse
@@ -132,7 +129,7 @@ SESSION_EMOJI = {"LONDON": "🇬🇧", "NEWYORK": "🇺🇸", "ASIAN": "🌏", "
 
 logging.basicConfig(level=logging.INFO,
                      format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("xauusd_v253")
+log = logging.getLogger("xauusd_v254")
 
 
 # ===========================================================================
@@ -161,7 +158,7 @@ def acquire_lock():
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB); locked = True
         except BlockingIOError:
-            log.warning("Another instance running. Exit.")
+            log.warning("Another instance running.")
         yield locked
     finally:
         if locked:
@@ -206,7 +203,7 @@ def is_high_impact_news_time() -> bool:
 # STATE
 # ===========================================================================
 DEFAULT_STATE = {
-    "version": 253,
+    "version": 254,
     "last_signal_time": None,
     "last_choppy_time": None,
     "last_healthcheck": None,
@@ -226,13 +223,13 @@ DEFAULT_STATE = {
 }
 
 def _req_sig_keys(s):
-    return all(k in s for k in ("type", "entry", "sl", "tp", "lot", "time", "expires_at"))
+    return all(k in s for k in ("type","entry","sl","tp","lot","time","expires_at"))
 
 def _merge_defaults(state):
     for k, v in DEFAULT_STATE.items():
         if k not in state:
             state[k] = json.loads(json.dumps(v))
-    state["version"] = 253
+    state["version"] = 254
     state["active_signals"] = [s for s in state.get("active_signals", [])
                                 if isinstance(s, dict) and _req_sig_keys(s)]
     return state
@@ -289,7 +286,7 @@ def cleanup_expired_signals(state):
     for sig in state.get("active_signals", []):
         try:
             if now > datetime.fromisoformat(sig["expires_at"]):
-                log.info("Signal expired: %s @ %s", sig["type"], sig["time"][:16])
+                log.info("Signal expired: %s", sig["type"])
                 outcomes.append("timeout")
                 sess = sig.get("session", "UNKNOWN")
                 so = state.setdefault("session_outcomes", {}).setdefault(
@@ -408,70 +405,142 @@ def send_telegram(message):
 
 
 # ===========================================================================
-# DATA SOURCES — v25.3 MULTI-SOURCE
+# DATA FETCHERS — PAXG MULTI-EXCHANGE (v25.4)
 # ===========================================================================
-def fetch_candles_deriv(granularity_sec, count=2500):
-    """Fetch XAUUSD spot dari Deriv WebSocket. No API key."""
+def _fetch_binance_paginated(symbol="PAXGUSDT", interval="15m", total_bars=5000):
+    all_data, end_time, remaining = [], None, total_bars
+    while remaining > 0:
+        limit = min(1000, remaining)
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time: params["endTime"] = end_time
+        try:
+            r = requests.get("https://api.binance.com/api/v3/klines",
+                              params=params, timeout=15,
+                              headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                if all_data: break
+                raise RuntimeError(f"HTTP {r.status_code}")
+            data = r.json()
+            if not data or not isinstance(data, list): break
+            all_data = data + all_data
+            if len(data) < limit: break
+            end_time = data[0][0] - 1
+            remaining -= len(data)
+            py_time.sleep(0.15)
+        except Exception as e:
+            if all_data: break
+            raise RuntimeError(f"Binance: {str(e)[:80]}")
+    if not all_data:
+        raise RuntimeError("Binance: no data")
+    df = pd.DataFrame(all_data, columns=[
+        "ot","o","h","l","c","v","ct","qv","t","tb","tq","ig"])
+    df["datetime"] = pd.to_datetime(df["ot"], unit="ms", utc=True)
+    for a, b in [("o","open"),("h","high"),("l","low"),("c","close"),("v","volume")]:
+        df[b] = pd.to_numeric(df[a], errors="coerce")
+    df = df[["datetime","open","high","low","close","volume"]]
+    df = df.dropna(subset=["datetime","open","high","low","close"])
+    return df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
+
+def _fetch_kraken(interval_min=15):
+    try:
+        r = requests.get("https://api.kraken.com/0/public/OHLC",
+                          params={"pair": "PAXGUSD", "interval": interval_min},
+                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        if data.get("error"): raise RuntimeError(f"API: {data['error']}")
+        result = data.get("result", {})
+        key = next((k for k in result.keys() if k != "last"), None)
+        if not key: raise RuntimeError("no data key")
+        rows = result[key]
+        if not rows or len(rows) < 100: raise RuntimeError(f"only {len(rows)}")
+        df = pd.DataFrame(rows, columns=["ts","open","high","low","close","vwap","volume","count"])
+        df["datetime"] = pd.to_datetime(df["ts"].astype("int64"), unit="s", utc=True)
+        for col in ("open","high","low","close","volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df[["datetime","open","high","low","close","volume"]]
+        df = df.dropna(subset=["datetime","open","high","low","close"])
+        return df.sort_values("datetime").reset_index(drop=True)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network: {e}")
+
+def _fetch_coinbase(interval_sec=900):
+    try:
+        r = requests.get("https://api.exchange.coinbase.com/products/PAXG-USD/candles",
+                          params={"granularity": interval_sec},
+                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        if not data or not isinstance(data, list): raise RuntimeError("empty")
+        df = pd.DataFrame(data, columns=["ts","low","high","open","close","volume"])
+        df["datetime"] = pd.to_datetime(df["ts"].astype("int64"), unit="s", utc=True)
+        for col in ("open","high","low","close","volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df[["datetime","open","high","low","close","volume"]]
+        df = df.dropna(subset=["datetime","open","high","low","close"])
+        return df.sort_values("datetime").reset_index(drop=True)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Network: {e}")
+
+def _fetch_bybit(interval="15", limit=200):
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/kline",
+                          params={"category":"spot","symbol":"PAXGUSDT",
+                                  "interval":interval,"limit":limit},
+                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        if data.get("retCode") != 0: raise RuntimeError(f"API: {data.get('retMsg')}")
+        rows = data.get("result", {}).get("list", [])
+        if not rows: raise RuntimeError("empty")
+        df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume","turnover"])
+        df["datetime"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+        for col in ("open","high","low","close","volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df[["datetime","open","high","low","close","volume"]]
+        df = df.dropna(subset=["datetime","open","high","low","close"])
+        return df.sort_values("datetime").reset_index(drop=True)
+    except Exception as e:
+        raise RuntimeError(f"Bybit: {str(e)[:80]}")
+
+def _fetch_deriv(granularity_sec, count=2500):
     try:
         import websocket
     except ImportError:
-        raise RuntimeError("websocket-client not installed")
-    
+        raise RuntimeError("websocket-client missing")
     url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    symbols = ["frxXAUUSD", "XAUUSD"]
-    last_error = None
-    
-    for symbol in symbols:
-        payload = {
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": count,
-            "end": "latest",
-            "granularity": granularity_sec,
-            "style": "candles",
-        }
+    for symbol in ("frxXAUUSD", "XAUUSD"):
+        payload = {"ticks_history": symbol, "adjust_start_time": 1,
+                   "count": count, "end": "latest",
+                   "granularity": granularity_sec, "style": "candles"}
         ws = None
         try:
-            ws = websocket.create_connection(url, timeout=20, enable_multithread=True)
+            ws = websocket.create_connection(url, timeout=15,
+                                              enable_multithread=True,
+                                              header={"User-Agent": "Mozilla/5.0"})
             ws.send(json.dumps(payload))
-            raw = ws.recv()
-            data = json.loads(raw)
-        except Exception as e:
-            last_error = e
-            log.debug("Deriv %s conn error: %s", symbol, e)
+            data = json.loads(ws.recv())
+        except Exception:
             continue
         finally:
             if ws:
                 try: ws.close()
                 except Exception: pass
-        
-        if "error" in data:
-            last_error = data["error"].get("message", "unknown")
-            log.debug("Deriv %s API error: %s", symbol, last_error)
-            continue
-        
+        if "error" in data: continue
         candles = data.get("candles", [])
-        if not candles or len(candles) < 100:
-            last_error = f"only {len(candles)} candles"
-            continue
-        
+        if not candles or len(candles) < 100: continue
         df = pd.DataFrame(candles)
         df["datetime"] = pd.to_datetime(df["epoch"].astype(int), unit="s", utc=True)
-        for col in ("open", "high", "low", "close"):
+        for col in ("open","high","low","close"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df["volume"] = 0.0
-        df = df[["datetime", "open", "high", "low", "close", "volume"]]
-        df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
-        df = df.sort_values("datetime").reset_index(drop=True)
-        log.info("Deriv %s OK: %d candles", symbol, len(df))
-        return df
-    
-    raise RuntimeError(f"Deriv all symbols failed: {last_error}")
+        df = df[["datetime","open","high","low","close","volume"]]
+        df = df.dropna(subset=["datetime","open","high","low","close"])
+        return df.sort_values("datetime").reset_index(drop=True)
+    raise RuntimeError("Deriv all failed")
 
-
-def fetch_candles_yahoo(ticker, interval, range_period, apply_offset=False):
-    """Fetch from Yahoo Finance. apply_offset=True only for futures."""
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_period}"
+def _fetch_yahoo_gcf(interval="15m", range_period="60d"):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_period}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     for attempt in range(1, 4):
         try:
@@ -483,60 +552,87 @@ def fetch_candles_yahoo(ticker, interval, range_period, apply_offset=False):
             res = result[0]
             ts = res.get("timestamp", [])
             quote = res.get("indicators", {}).get("quote", [{}])[0]
-            if not ts or not quote: raise ValueError("Yahoo missing fields")
-            df = pd.DataFrame({
-                "epoch": ts,
+            if not ts or not quote: raise ValueError("Yahoo missing")
+            df = pd.DataFrame({"epoch": ts,
                 "open": quote.get("open"), "high": quote.get("high"),
                 "low": quote.get("low"), "close": quote.get("close"),
-                "volume": quote.get("volume"),
-            })
+                "volume": quote.get("volume")})
             df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
-            for col in ("open", "high", "low", "close"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-                if apply_offset:
-                    df[col] = df[col] - CONFIG.price_offset
+            for col in ("open","high","low","close"):
+                df[col] = pd.to_numeric(df[col], errors="coerce") - CONFIG.price_offset
             df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-            df = df[["datetime", "open", "high", "low", "close", "volume"]]
-            df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+            df = df[["datetime","open","high","low","close","volume"]]
+            df = df.dropna(subset=["datetime","open","high","low","close"])
             df = df.sort_values("datetime").reset_index(drop=True)
             if len(df) < CONFIG.min_candles:
-                raise ValueError(f"Data short: {len(df)}")
+                raise ValueError(f"short {len(df)}")
             return df
         except Exception as e:
-            log.warning("Yahoo %s attempt %d: %s", ticker, attempt, e)
+            log.warning("Yahoo GC=F #%d: %s", attempt, e)
             py_time.sleep(2 * attempt)
-    raise RuntimeError(f"Yahoo {ticker} failed")
-
+    raise RuntimeError("Yahoo GC=F failed")
 
 def fetch_candles(interval="15m", range_period="60d"):
-    """Multi-source: (df, source_name). Priority: Deriv → Yahoo spot → Yahoo futures."""
-    gran_map = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
+    binance_iv = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"4h"}.get(interval,"15m")
+    kraken_iv = {"1m":1,"5m":5,"15m":15,"30m":30,"1h":60,"4h":240}.get(interval,15)
+    coinbase_iv = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400}.get(interval,900)
+    bybit_iv = {"1m":"1","5m":"5","15m":"15","30m":"30","1h":"60","4h":"240"}.get(interval,"15")
+    gran_map = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400}
     gran = gran_map.get(interval, 900)
-    
-    # 1. Deriv (spot, no offset needed)
+
+    # 1. Binance PAXG (best)
     try:
-        df = fetch_candles_deriv(gran, count=2500)
+        df = _fetch_binance_paginated("PAXGUSDT", binance_iv, 5000)
         if len(df) >= CONFIG.min_candles:
+            log.info("✅ BINANCE_PAXG: %d bars", len(df))
+            return df, "BINANCE_PAXG"
+    except Exception as e:
+        log.warning("Binance PAXG failed: %s", e)
+
+    # 2. Kraken
+    try:
+        df = _fetch_kraken(kraken_iv)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ KRAKEN_PAXG: %d bars", len(df))
+            return df, "KRAKEN_PAXG"
+    except Exception as e:
+        log.warning("Kraken failed: %s", e)
+
+    # 3. Coinbase
+    try:
+        df = _fetch_coinbase(coinbase_iv)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ COINBASE_PAXG: %d bars", len(df))
+            return df, "COINBASE_PAXG"
+    except Exception as e:
+        log.warning("Coinbase failed: %s", e)
+
+    # 4. Bybit
+    try:
+        df = _fetch_bybit(bybit_iv, 200)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ BYBIT_PAXG: %d bars", len(df))
+            return df, "BYBIT_PAXG"
+    except Exception as e:
+        log.warning("Bybit failed: %s", e)
+
+    # 5. Deriv (may fail from datacenter)
+    try:
+        df = _fetch_deriv(gran, 2500)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ DERIV: %d bars", len(df))
             return df, "DERIV"
-        log.warning("Deriv only %d candles", len(df))
     except Exception as e:
         log.warning("Deriv failed: %s", e)
-    
-    # 2. Yahoo XAUUSD=X (spot, no offset)
+
+    # 6. Yahoo GC=F (last resort)
     try:
-        df = fetch_candles_yahoo("XAUUSD=X", interval, range_period, apply_offset=False)
-        return df, "YAHOO_SPOT"
-    except Exception as e:
-        log.warning("Yahoo spot failed: %s", e)
-    
-    # 3. Yahoo GC=F (futures, with offset — LAST RESORT)
-    try:
-        df = fetch_candles_yahoo("GC=F", interval, range_period, apply_offset=True)
-        log.critical("⚠️ USING FUTURES FALLBACK — offset %.2f may be inaccurate", CONFIG.price_offset)
+        df = _fetch_yahoo_gcf(interval, range_period)
+        log.critical("⚠️ YAHOO_FUTURES fallback — offset $%.2f may be off", CONFIG.price_offset)
         return df, "YAHOO_FUTURES"
     except Exception as e:
-        log.warning("Yahoo futures failed: %s", e)
-    
+        log.warning("Yahoo GC=F failed: %s", e)
+
     raise RuntimeError("ALL data sources failed")
 
 
@@ -545,7 +641,7 @@ def sanitize_and_trim(df):
     df = df.drop_duplicates(subset="datetime")
     df = df[(df["high"] >= df["low"]) & (df["close"] > 0) & (df["open"] > 0)]
     df = df.replace([np.inf, -np.inf], np.nan).dropna(
-        subset=["open", "high", "low", "close"])
+        subset=["open","high","low","close"])
     df = df.sort_values("datetime").reset_index(drop=True)
     if len(df) < 2: return None
     age_min = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
@@ -850,7 +946,7 @@ def save_cached_models(fp, payload):
         log.warning("Cache save: %s", e)
 
 def model_fingerprint(df_feat):
-    return f"v253_{df_feat['datetime'].iloc[-1].floor('h').isoformat()}"
+    return f"v254_{df_feat['datetime'].iloc[-1].floor('h').isoformat()}"
 
 def get_or_train_models(df_feat, use_cache=True):
     fp = model_fingerprint(df_feat)
@@ -873,7 +969,7 @@ def check_vol_regime(df_feat):
 
 
 # ===========================================================================
-# TRADE
+# TRADE COMPUTE
 # ===========================================================================
 def compute_trade(sig_type, df_feat, prob, meta_prob, state, source):
     last = df_feat.iloc[-1]
@@ -895,15 +991,12 @@ def compute_trade(sig_type, df_feat, prob, meta_prob, state, source):
     lot = (CONFIG.min_lot if sl_abs <= 0 else
            max(min(round(risk_usd / (sl_abs * CONFIG.contract_size), 2),
                    CONFIG.max_lot), CONFIG.min_lot))
-    expires = now_utc() + timedelta(
-        minutes=CONFIG.timeframe_minutes * CONFIG.forward_bars * 2)
-    return {
-        "type": sig_type, "entry": round(price, 2), "sl": round(sl, 2),
-        "tp": round(tp, 2), "lot": lot, "risk_pct": round(risk_pct, 2),
-        "risk_usd": round(risk_usd, 2), "prob": prob, "meta_prob": meta_prob,
-        "session": get_current_session(), "source": source,
-        "time": now_utc().isoformat(), "expires_at": expires.isoformat(),
-    }
+    expires = now_utc() + timedelta(minutes=CONFIG.timeframe_minutes * CONFIG.forward_bars * 2)
+    return {"type": sig_type, "entry": round(price, 2), "sl": round(sl, 2),
+            "tp": round(tp, 2), "lot": lot, "risk_pct": round(risk_pct, 2),
+            "risk_usd": round(risk_usd, 2), "prob": prob, "meta_prob": meta_prob,
+            "session": get_current_session(), "source": source,
+            "time": now_utc().isoformat(), "expires_at": expires.isoformat()}
 
 def has_conflicting_signal(state, new_type):
     now = now_utc()
@@ -918,21 +1011,20 @@ def has_conflicting_signal(state, new_type):
 
 def append_trade_journal(trade, df_feat, state):
     last = df_feat.iloc[-1]
-    entry = {
-        "ts": now_utc().isoformat(), "candle_ts": last["datetime"].isoformat(),
-        "type": trade["type"], "session": trade.get("session", "UNKNOWN"),
-        "source": trade.get("source", "UNKNOWN"),
-        "entry": trade["entry"], "sl": trade["sl"], "tp": trade["tp"],
-        "lot": trade["lot"], "prob": trade["prob"],
-        "meta_prob": trade.get("meta_prob", 0),
-        "features": {f: float(last[f]) for f in FEATURES if pd.notna(last.get(f))},
-    }
+    entry = {"ts": now_utc().isoformat(), "candle_ts": last["datetime"].isoformat(),
+             "type": trade["type"], "session": trade.get("session", "UNKNOWN"),
+             "source": trade.get("source", "UNKNOWN"),
+             "entry": trade["entry"], "sl": trade["sl"], "tp": trade["tp"],
+             "lot": trade["lot"], "prob": trade["prob"],
+             "meta_prob": trade.get("meta_prob", 0),
+             "features": {f: float(last[f]) for f in FEATURES if pd.notna(last.get(f))}}
     j = state.get("trade_journal", []); j.append(entry)
     state["trade_journal"] = j[-CONFIG.max_journal_entries:]
 
 def format_signal_message(trade, h1, hurst, entropy, wick, time_str, meta, source):
     emoji = "🟢" if trade["type"] == "BUY" else "🔴"
-    src_emoji = {"DERIV": "🟢", "YAHOO_SPOT": "🟡", "YAHOO_FUTURES": "🔴"}.get(source, "❓")
+    src_emoji = {"BINANCE_PAXG":"🟢","KRAKEN_PAXG":"🟡","COINBASE_PAXG":"🟡",
+                 "BYBIT_PAXG":"🟡","DERIV":"🟢","YAHOO_FUTURES":"🔴"}.get(source,"❓")
     return (
         f"<b>{emoji} XAUUSD {trade['type']} [{trade.get('session','?')}]</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -975,34 +1067,30 @@ def _compute_monitor_metrics(state):
     for t in reversed(recent):
         if t == "loss": consec += 1
         elif t == "win": break
-
     sess_out = state.get("session_outcomes", {})
     sess_breakdown = []
-    for sess in ("LONDON", "NEWYORK", "ASIAN", "LATE"):
+    for sess in ("LONDON","NEWYORK","ASIAN","LATE"):
         d = sess_out.get(sess, {})
-        w, l, t = d.get("wins", 0), d.get("losses", 0), d.get("timeouts", 0)
+        w, l, t = d.get("wins",0), d.get("losses",0), d.get("timeouts",0)
         n = w + l
         sess_breakdown.append({"session": sess, "wins": w, "losses": l,
                                 "timeouts": t, "trades": n,
                                 "win_rate": w/n if n > 0 else 0.0})
-
-    return {
-        "wins": wins, "losses": losses, "total": total, "win_rate": wr,
-        "roll_wr": roll_wr, "roll_n": len(roll), "consec_losses": consec,
-        "active_n": len(state.get("active_signals", [])),
-        "recent_10": recent[-10:], "sess_breakdown": sess_breakdown,
-        "model_metrics": state.get("last_model_metrics", {}),
-        "daily_pnl": state.get("daily_pnl_usd", 0.0),
-        "daily_signals": state.get("daily_signals_count", 0),
-        "adaptive_threshold": state.get("adaptive_threshold", 0.60),
-        "last_signal_time": state.get("last_signal_time"),
-        "last_data_source": state.get("last_data_source"),
-    }
+    return {"wins": wins, "losses": losses, "total": total, "win_rate": wr,
+            "roll_wr": roll_wr, "roll_n": len(roll), "consec_losses": consec,
+            "active_n": len(state.get("active_signals", [])),
+            "recent_10": recent[-10:], "sess_breakdown": sess_breakdown,
+            "model_metrics": state.get("last_model_metrics", {}),
+            "daily_pnl": state.get("daily_pnl_usd", 0.0),
+            "daily_signals": state.get("daily_signals_count", 0),
+            "adaptive_threshold": state.get("adaptive_threshold", 0.60),
+            "last_signal_time": state.get("last_signal_time"),
+            "last_data_source": state.get("last_data_source")}
 
 def _compute_monitor_alerts(m, state):
     alerts = []
     if os.path.exists(CONFIG.kill_switch_path):
-        alerts.append("🔴 <b>KILL SWITCH FILE</b> aktif")
+        alerts.append("🔴 <b>KILL SWITCH</b> aktif")
     if m["consec_losses"] >= CONFIG.max_consecutive_losses:
         alerts.append(f"🔴 {m['consec_losses']} consecutive losses")
     elif m["consec_losses"] >= 3:
@@ -1011,20 +1099,23 @@ def _compute_monitor_alerts(m, state):
         alerts.append(f"🔴 Rolling WR {m['roll_wr']*100:.1f}%")
     if m["adaptive_threshold"] >= CONFIG.max_threshold:
         alerts.append(f"🟠 Threshold stuck {m['adaptive_threshold']:.2f}")
-    if m.get("last_data_source") == "YAHOO_FUTURES":
-        alerts.append("🔴 Using FUTURES fallback — spot sources failed!")
+    src = m.get("last_data_source", "") or ""
+    if src == "YAHOO_FUTURES":
+        alerts.append("🔴 YAHOO FUTURES — all PAXG failed!")
+    elif src.startswith("BINANCE_"):
+        alerts.append(f"🟢 {src}")
+    elif src.endswith("_PAXG"):
+        alerts.append(f"🟡 {src}")
     if not alerts:
-        alerts.append("🟢 Semua sistem normal")
+        alerts.append("🟢 Sistem normal")
     return alerts
 
 def _format_monitor_daily(m, alerts):
     now = now_wib()
     day = ["Senin","Selasa","Rabu","Kamis","Jumat","Sabtu","Minggu"][now.weekday()]
-    parts = [
-        f"<b>📊 XAUUSD BOT — DAILY REPORT</b>",
-        f"🗓️ {now.strftime('%Y-%m-%d')} ({day}) {now.strftime('%H:%M')} WIB",
-        "━━━━━━━━━━━━━━━━━━━━━━", "", "<b>⚠️ SYSTEM ALERTS</b>",
-    ]
+    parts = [f"<b>📊 XAUUSD — DAILY REPORT</b>",
+             f"🗓️ {now.strftime('%Y-%m-%d')} ({day}) {now.strftime('%H:%M')} WIB",
+             "━━━━━━━━━━━━━━━━━━━━━━", "", "<b>⚠️ ALERTS</b>"]
     parts.extend(alerts); parts.append("")
     parts.append("<b>📈 PERFORMANCE</b>")
     if m["total"] > 0:
@@ -1034,43 +1125,36 @@ def _format_monitor_daily(m, alerts):
             parts.append(f"Rolling {m['roll_n']}: <b>{m['roll_wr']*100:.1f}%</b> "
                           f"{_wr_badge(m['roll_wr'])}")
     else:
-        parts.append("Belum ada trade closed.")
+        parts.append("Belum ada trade.")
     parts.append("")
-    pnl_e = "🟢" if m["daily_pnl"] >= 0 else "🔴"
-    parts.append(f"<b>💰 HARI INI</b>\nPnL: {pnl_e} <b>${m['daily_pnl']:+.2f}</b> "
-                  f"| Signals: <b>{m['daily_signals']}</b>")
-    parts.append("")
-
-    has_sess = any(s["trades"] > 0 or s["timeouts"] > 0 for s in m["sess_breakdown"])
-    if has_sess:
-        parts.append("<b>🎯 SESSION BREAKDOWN</b>")
+    pe = "🟢" if m["daily_pnl"] >= 0 else "🔴"
+    parts.append(f"<b>💰 HARI INI</b>\nPnL: {pe} <b>${m['daily_pnl']:+.2f}</b> "
+                  f"| Signals: <b>{m['daily_signals']}</b>\n")
+    if any(s["trades"] > 0 or s["timeouts"] > 0 for s in m["sess_breakdown"]):
+        parts.append("<b>🎯 SESSION</b>")
         for s in m["sess_breakdown"]:
             if s["trades"] == 0 and s["timeouts"] == 0: continue
             em = SESSION_EMOJI.get(s["session"], "•")
-            wrb = _wr_badge(s["win_rate"]) if s["trades"] > 0 else "—"
-            parts.append(f"{em} {s['session']:<8} {s['trades']:>2} trades "
-                          f"{wrb} {s['win_rate']*100:>5.1f}%"
+            wb = _wr_badge(s["win_rate"]) if s["trades"] > 0 else "—"
+            parts.append(f"{em} {s['session']:<8} {s['trades']:>2} {wb} "
+                          f"{s['win_rate']*100:>5.1f}%"
                           + (f" ({s['timeouts']}T)" if s["timeouts"] else ""))
         parts.append("")
-
     if m["recent_10"]:
         icons = "".join({"win":"✅","loss":"❌","timeout":"⏱️"}.get(t,"?")
                          for t in m["recent_10"])
         w10 = sum(1 for t in m["recent_10"] if t == "win")
-        parts.append(f"<b>🕐 RECENT</b>\n{icons} — {w10}/{len(m['recent_10'])} wins\n")
-
+        parts.append(f"<b>🕐 RECENT</b>\n{icons} — {w10}/{len(m['recent_10'])}\n")
     mm = m["model_metrics"]
     if mm:
         parts.append("<b>🧠 MODEL</b>")
         parts.append(f"Meta AUC: <b>{mm.get('meta_auc',0):.3f}</b> "
                       f"| Brier: <b>{mm.get('meta_brier',0):.3f}</b>")
         parts.append(f"WF AUC: {mm.get('wf_auc',0):.3f} "
-                      f"| WF Prec: {mm.get('wf_prec',0):.3f}")
-        parts.append("")
-
+                      f"| WF Prec: {mm.get('wf_prec',0):.3f}\n")
     parts.append("<b>⚙️ SYSTEM</b>")
     parts.append(f"Threshold: <b>{m['adaptive_threshold']:.2f}</b>")
-    parts.append(f"Data source: <b>{m.get('last_data_source', 'UNKNOWN')}</b>")
+    parts.append(f"Source: <b>{m.get('last_data_source', 'N/A')}</b>")
     parts.append(f"Active: {m['active_n']}")
     parts.append("")
     parts.append(f"<i>💵 Modal: ${CONFIG.account_equity:.2f}</i>")
@@ -1078,28 +1162,22 @@ def _format_monitor_daily(m, alerts):
 
 def _format_monitor_weekly(m):
     now = now_wib()
-    parts = [
-        "<b>📅 XAUUSD — WEEKLY</b>",
-        f"🗓️ Week ending {now.strftime('%d/%m/%Y')}",
-        "━━━━━━━━━━━━━━━━━━━━━━", "",
-        f"Closed: <b>{m['total']}</b>",
-        f"WR: <b>{m['win_rate']*100:.1f}%</b> {_wr_badge(m['win_rate'])}",
-    ]
+    parts = ["<b>📅 XAUUSD — WEEKLY</b>",
+             f"🗓️ Week ending {now.strftime('%d/%m/%Y')}",
+             "━━━━━━━━━━━━━━━━━━━━━━", "",
+             f"Closed: <b>{m['total']}</b>",
+             f"WR: <b>{m['win_rate']*100:.1f}%</b> {_wr_badge(m['win_rate'])}"]
     if m["sess_breakdown"] and any(s["trades"] >= 3 for s in m["sess_breakdown"]):
         best = max(m["sess_breakdown"], key=lambda s: s["win_rate"] if s["trades"] >= 3 else 0)
         parts.append(f"Best: <b>{best['session']}</b> ({best['win_rate']*100:.0f}%)")
-    parts.append("")
-    parts.append("<b>💡 REKOMENDASI</b>")
-    if m["total"] < 10:
-        parts.append("⏳ Sample sedikit.")
+    parts.append("\n<b>💡 REKOMENDASI</b>")
+    if m["total"] < 10: parts.append("⏳ Sample sedikit.")
     elif m["win_rate"] >= 0.55 and m["roll_n"] >= 10 and m["roll_wr"] >= 0.50:
-        parts.append("✅ Sehat. Pertimbangkan naikkan modal pelan.")
-    elif m["win_rate"] >= 0.45:
-        parts.append("🟡 Marginal. Pertahankan modal kecil.")
+        parts.append("✅ Sehat. Naikkan modal pelan.")
+    elif m["win_rate"] >= 0.45: parts.append("🟡 Marginal. Pertahankan modal.")
     elif m["win_rate"] < 0.40 and m["total"] >= 20:
-        parts.append("🔴 STOP, jalankan backtest.")
-    else:
-        parts.append("🟠 Waspada.")
+        parts.append("🔴 STOP, backtest ulang.")
+    else: parts.append("🟠 Waspada.")
     return "\n".join(parts)
 
 def run_monitor(state=None, force=False, dry_run=False):
@@ -1133,47 +1211,35 @@ def run_healthcheck():
     log.info("=== HEALTHCHECK ===")
     state = load_gist_state()
     now = now_utc()
-    
     last_hc = state.get("last_healthcheck")
     if last_hc:
         try:
             if (now - datetime.fromisoformat(last_hc)).total_seconds() < CONFIG.healthcheck_interval_hrs * 3600:
-                log.info("Healthcheck not due."); return
+                log.info("Not due."); return
         except Exception: pass
-    
     problems = []
     if os.path.exists(CONFIG.kill_switch_path):
-        problems.append("🔴 Kill switch file active")
-    
+        problems.append("🔴 Kill switch active")
     if state.get("last_signal_time") and not is_weekend() and not is_friday_cutoff():
         try:
             hrs = (now - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 3600
             if hrs > CONFIG.last_sig_alert_hrs:
-                problems.append(f"🟠 No signal for {hrs:.0f}h")
+                problems.append(f"🟠 No signal {hrs:.0f}h")
         except Exception: pass
-    
-    today = now_wib().strftime("%Y-%m-%d")
-    if now_wib().hour >= 10 and state.get("last_report_date") != today and now_wib().weekday() < 5:
-        problems.append(f"🟠 Daily report missing today")
-    
+    if now_wib().hour >= 10 and state.get("last_report_date") != now_wib().strftime("%Y-%m-%d") and now_wib().weekday() < 5:
+        problems.append("🟠 Daily report missing")
     if state.get("last_data_source") == "YAHOO_FUTURES":
-        problems.append("🔴 Using futures fallback — check spot sources")
-    
+        problems.append("🔴 FUTURES fallback")
     if not problems:
-        log.info("Healthcheck OK.")
-        state["last_healthcheck"] = now.isoformat()
-        save_gist_state(state)
-        return
-    
-    msg = "<b>⚠️ HEALTHCHECK</b>\n" + "\n".join(problems)
-    send_telegram(msg)
-    log.warning("Healthcheck issues: %s", problems)
+        log.info("OK."); state["last_healthcheck"] = now.isoformat()
+        save_gist_state(state); return
+    send_telegram("<b>⚠️ HEALTHCHECK</b>\n" + "\n".join(problems))
     state["last_healthcheck"] = now.isoformat()
     save_gist_state(state)
 
 
 # ===========================================================================
-# AUDIT FEATURES
+# AUDIT
 # ===========================================================================
 def run_audit_features():
     log.info("=== FEATURE AUDIT ===")
@@ -1188,23 +1254,19 @@ def run_audit_features():
     df_lab = triple_barrier_labels(df_feat, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
     train = df_lab.iloc[:-CONFIG.forward_bars]
     X, y = train[FEATURES].to_numpy(), train["label"].to_numpy()
-    if len(np.unique(y)) < 2:
-        log.error("Only one class."); return
-    split = int(len(X) * 0.8)
-    tr_end = split - CONFIG.forward_bars
+    if len(np.unique(y)) < 2: log.error("One class."); return
+    split = int(len(X) * 0.8); tr_end = split - CONFIG.forward_bars
     if tr_end < 100: log.error("Insufficient."); return
-    log.info("Training on %d samples, testing on %d", tr_end, len(X) - split)
-    model = build_light_model()
-    model.fit(X[:tr_end], y[:tr_end])
+    model = build_light_model(); model.fit(X[:tr_end], y[:tr_end])
     try:
         from sklearn.inspection import permutation_importance
-        imp = permutation_importance(model, X[split:], y[split:],
-                                       n_repeats=5, random_state=42, n_jobs=-1)
+        imp = permutation_importance(model, X[split:], y[split:], n_repeats=5,
+                                       random_state=42, n_jobs=-1)
     except Exception as e:
         log.error("Importance: %s", e); return
     results = sorted(zip(FEATURES, imp.importances_mean, imp.importances_std),
                       key=lambda x: -x[1])
-    print("\n" + "="*70 + "\nFEATURE IMPORTANCE (permutation, OOS)\n" + "="*70)
+    print("\n" + "="*70 + "\nFEATURE IMPORTANCE\n" + "="*70)
     print(f"{'Feature':<24} {'Mean':>10} {'Std':>8}  Bar")
     print("-"*70)
     for name, mean, std in results:
@@ -1213,8 +1275,8 @@ def run_audit_features():
     to_drop = [n for n, m, s in results if m < 0.001]
     keep = [n for n, m, s in results if m >= 0.001]
     print("\n" + "="*70)
-    print(f"Suggested DROP ({len(to_drop)}): {to_drop}")
-    print(f"Suggested KEEP ({len(keep)}): {keep}")
+    print(f"DROP ({len(to_drop)}): {to_drop}")
+    print(f"KEEP ({len(keep)}): {keep}")
     print("="*70)
 
 
@@ -1222,23 +1284,34 @@ def run_audit_features():
 # TEST SOURCES
 # ===========================================================================
 def run_test_sources():
-    print("Testing data sources...\n")
+    print("Testing all sources (15m, ~500 bars)...\n")
     tests = [
-        ("DERIV (spot)", lambda: fetch_candles_deriv(900, count=500)),
-        ("YAHOO XAUUSD=X (spot)", lambda: fetch_candles_yahoo("XAUUSD=X", "15m", "5d", False)),
-        ("YAHOO GC=F (futures)", lambda: fetch_candles_yahoo("GC=F", "15m", "5d", True)),
+        ("BINANCE PAXG (paged)", lambda: _fetch_binance_paginated("PAXGUSDT", "15m", 500)),
+        ("KRAKEN PAXG", lambda: _fetch_kraken(15)),
+        ("COINBASE PAXG", lambda: _fetch_coinbase(900)),
+        ("BYBIT PAXG", lambda: _fetch_bybit("15", 200)),
+        ("YAHOO GC=F", lambda: _fetch_yahoo_gcf("15m", "5d")),
     ]
+    results = {}
     for name, fn in tests:
         t0 = py_time.time()
         try:
             df = fn()
             el = py_time.time() - t0
             last = df.iloc[-1]
-            print(f"✅ {name:<25} {len(df):>5} bars | {el:>5.2f}s | "
-                  f"close={last['close']:.2f} @ {last['datetime']}")
+            close = float(last["close"])
+            results[name] = close
+            print(f"✅ {name:<22} {len(df):>5} bars | {el:>5.2f}s | close=${close:.2f}")
         except Exception as e:
-            print(f"❌ {name:<25} FAILED: {str(e)[:80]}")
-    print("\nDone.")
+            print(f"❌ {name:<22} FAILED: {str(e)[:80]}")
+    if len(results) >= 2:
+        print("\n=== DIFFERENCES ===")
+        base = results.get("BINANCE PAXG (paged)") or next(iter(results.values()))
+        for name, close in results.items():
+            diff = close - base
+            pct = diff / base * 100
+            print(f"{name:<22} ${diff:+.2f} ({pct:+.2f}%)")
+    print("\nPAXG sources should agree within $5. GC=F ~$20-40 above.")
 
 
 # ===========================================================================
@@ -1324,7 +1397,7 @@ class WalkForwardBacktest:
         if sharpe >= 1.0 and pf >= 1.5 and wr >= 0.50 and dd > -0.15:
             return "✅ LAYAK LIVE"
         if sharpe >= 0.5 and pf >= 1.2 and wr >= 0.45:
-            return "⚠️ MARGINAL — demo dulu"
+            return "⚠️ MARGINAL"
         return "❌ JANGAN LIVE"
 
 
@@ -1333,7 +1406,7 @@ class WalkForwardBacktest:
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v25.3 — Multi-Source Spot")
+    log.info("XAUUSD v25.4 — PAXG Live")
     log.info("=" * 60)
     validate_config()
     with acquire_lock() as locked:
@@ -1343,11 +1416,9 @@ def main():
         state = cleanup_expired_signals(state)
 
         if is_weekend():
-            log.info("Weekend. Cleanup only.")
-            save_gist_state(state); return
+            log.info("Weekend."); save_gist_state(state); return
         if is_friday_cutoff():
-            log.info("Friday cutoff.")
-            save_gist_state(state); return
+            log.info("Friday cutoff."); save_gist_state(state); return
         if check_kill_switch(state):
             save_gist_state(state); return
         if state["daily_signals_count"] >= CONFIG.max_daily_signals:
@@ -1356,13 +1427,13 @@ def main():
             log.info("Daily loss limit."); return
         if state.get("last_signal_time"):
             try:
-                mins = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 60
+                mins = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds()/60
                 if mins < get_session_cooldown():
-                    log.info("Cooldown (%.0f min).", mins); return
+                    log.info("Cooldown (%.0f).", mins); return
             except Exception: pass
         if state.get("last_choppy_time"):
             try:
-                mins = (now_utc() - datetime.fromisoformat(state["last_choppy_time"])).total_seconds() / 60
+                mins = (now_utc() - datetime.fromisoformat(state["last_choppy_time"])).total_seconds()/60
                 if mins < CONFIG.choppy_cooldown_minutes: return
             except Exception: pass
         if is_high_impact_news_time():
@@ -1374,7 +1445,7 @@ def main():
             if df is None: return
         except Exception as e:
             log.error("Fetch: %s", e); return
-        log.info("✅ Data: %s (%d bars)", source, len(df))
+        log.info("✅ Data: %s (%d)", source, len(df))
         state["last_data_source"] = source
 
         state = evaluate_active_signals(df, state)
@@ -1404,8 +1475,8 @@ def main():
             state["last_choppy_time"] = now_utc().isoformat()
             save_gist_state(state); return
 
-        rng_ = float(last["high"] - last["low"]); body = abs(float(last["close"] - last["open"]))
-        wick = (rng_ - body) / (rng_ + 1e-12) if rng_ > 0 else 1.0
+        rng_ = float(last["high"]-last["low"]); body = abs(float(last["close"]-last["open"]))
+        wick = (rng_-body)/(rng_+1e-12) if rng_ > 0 else 1.0
         if wick > CONFIG.max_wick_ratio_threshold:
             state["last_choppy_time"] = now_utc().isoformat()
             save_gist_state(state); return
@@ -1425,27 +1496,24 @@ def main():
             save_gist_state(state); return
 
         state["last_model_metrics"] = {
-            "meta_auc": round(models.get("meta_auc", 0), 3),
-            "meta_brier": round(models.get("meta_brier", 0), 3),
-            "wf_auc": round(models.get("wf_auc", 0), 3),
-            "wf_prec": round(models.get("wf_prec", 0), 3),
-            "trained_at": now_utc().isoformat(),
-        }
+            "meta_auc": round(models.get("meta_auc",0),3),
+            "meta_brier": round(models.get("meta_brier",0),3),
+            "wf_auc": round(models.get("wf_auc",0),3),
+            "wf_prec": round(models.get("wf_prec",0),3),
+            "trained_at": now_utc().isoformat()}
 
         pred = predict_from_models(df_feat.iloc[[-1]], models)
         side = pred.get("side", 0)
         if side == 0: save_gist_state(state); return
-
         meta_prob = pred.get("meta_prob", 0.0)
-        pb, ps = pred.get("primary_buy_prob", 0.0), pred.get("primary_sell_prob", 0.0)
+        pb, ps = pred.get("primary_buy_prob",0.0), pred.get("primary_sell_prob",0.0)
         th = state["adaptive_threshold"]
         log.info("Prob: B=%.1f%% S=%.1f%% M=%.1f%% T=%.1f%%",
                  pb*100, ps*100, meta_prob*100, th*100)
-
         if meta_prob < CONFIG.meta_min_probability: save_gist_state(state); return
         sig = None
-        if side == 1 and pb >= th and h1 in ("BUY", "NEUTRAL"): sig = "BUY"
-        elif side == -1 and ps >= th and h1 in ("SELL", "NEUTRAL"): sig = "SELL"
+        if side == 1 and pb >= th and h1 in ("BUY","NEUTRAL"): sig = "BUY"
+        elif side == -1 and ps >= th and h1 in ("SELL","NEUTRAL"): sig = "SELL"
         if not sig: save_gist_state(state); return
         if has_conflicting_signal(state, sig): save_gist_state(state); return
 
@@ -1455,7 +1523,6 @@ def main():
                                      analyzed_time, models, source)
         if not send_telegram(msg):
             log.error("Telegram failed."); save_gist_state(state); return
-
         state["active_signals"].append(trade)
         state["daily_signals_count"] += 1
         state["last_signal_time"] = now_utc().isoformat()
@@ -1475,13 +1542,13 @@ def run_backtest_cli(days, equity):
     log.info("Bars: %d", len(df_feat))
     bt = WalkForwardBacktest(df_feat, BacktestConfig(initial_equity=equity))
     report = bt.run()
-    print("\n" + "="*60 + "\nBACKTEST REPORT (source: " + source + ")\n" + "="*60)
+    print("\n" + "="*60 + "\nBACKTEST (" + source + ")\n" + "="*60)
     print(json.dumps(report, indent=2, default=str))
     print("="*60)
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="XAUUSD v25.3")
+    p = argparse.ArgumentParser(description="XAUUSD v25.4")
     p.add_argument("--backtest", action="store_true")
     p.add_argument("--days", type=int, default=60)
     p.add_argument("--equity", type=float, default=10000)
