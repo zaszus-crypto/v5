@@ -2,14 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-XAUUSD MODERN QUANT SIGNAL BOT - v25.1 (Weekday 24/7 Forensic-Hardened)
+XAUUSD MODERN QUANT SIGNAL BOT - v25.2 (Combined Bot + Monitor)
 ================================================================================
-Mon-Fri 24 hours. Sat-Sun OFF. All sessions (Asian/London/NY).
-Auto risk halved on Asian. Friday cutoff for weekend gap protection.
+Modes:
+    python bot.py                        # Live bot signal (default)
+    python bot.py --backtest [--days N] [--equity X]
+    python bot.py --monitor              # Force send daily+weekly report
+    python bot.py --monitor-check        # Send report if due (08:00 WIB)
+    python bot.py --monitor-dry-run      # Print report only
 ================================================================================
 """
 
-import os, sys, json, pickle, hashlib, logging, argparse
+import os, sys, json, pickle, logging, argparse
 import time as py_time
 import fcntl
 from contextlib import contextmanager
@@ -24,11 +28,13 @@ import requests
 from sklearn.ensemble import (
     RandomForestClassifier, GradientBoostingClassifier, VotingClassifier,
 )
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import precision_score, roc_auc_score, brier_score_loss
 
 
+# ===========================================================================
+# CONFIG
+# ===========================================================================
 @dataclass(frozen=True)
 class Config:
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
@@ -36,6 +42,7 @@ class Config:
     gist_token: str = os.getenv("GH_GIST_TOKEN", "")
     gist_id: str = os.getenv("GH_GIST_ID", "")
     backtest_mode: bool = os.getenv("BACKTEST_MODE", "false").lower() == "true"
+    monitor_hour_wib: int = int(os.getenv("MONITOR_HOUR_WIB", "8"))
 
     timeframe_minutes: int = 15
     min_candles: int = 300
@@ -57,17 +64,16 @@ class Config:
     max_wick_ratio_threshold: float = 0.70
     max_trend_age_bars: int = 18
 
-    # Session-aware (v25.1)
     cooldown_minutes: int = 120
     choppy_cooldown_minutes: int = 30
-    max_daily_signals: int = 6          # naik dari 3 untuk 24/7
-    max_daily_loss_pct: float = 4.0     # naik dari 3.0
+    max_daily_signals: int = 6
+    max_daily_loss_pct: float = 4.0
     session_aware_cooldown: bool = True
     session_aware_risk: bool = True
-    friday_cutoff_hour: int = 21        # WIB — no new signals after
+    friday_cutoff_hour: int = 21
 
     price_offset: float = 30.0
-    account_equity: float = 200.0       # konservatif
+    account_equity: float = 200.0
     risk_percent: float = 1.0
     min_risk_percent: float = 0.5
     max_risk_percent: float = 1.5
@@ -116,9 +122,13 @@ FEATURES = [
     "session_newyork", "session_overlap",
 ]
 
-logging.basicConfig(level=logging.INFO,
-                     format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("xauusd_v251")
+SESSION_EMOJI = {"LONDON": "🇬🇧", "NEWYORK": "🇺🇸", "ASIAN": "🌏", "LATE": "🌙"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("xauusd_v252")
 
 
 # ===========================================================================
@@ -135,7 +145,8 @@ def validate_config():
         miss = [k for k, v in [("TELEGRAM_TOKEN", CONFIG.telegram_token),
                                 ("TELEGRAM_CHAT_ID", CONFIG.telegram_chat_id)] if not v]
         if miss:
-            log.critical("Missing config: %s", ", ".join(miss)); sys.exit(1)
+            log.critical("Missing config: %s", ", ".join(miss))
+            sys.exit(1)
     if not CONFIG.gist_token or not CONFIG.gist_id:
         log.warning("Gist not configured — state won't persist.")
 
@@ -145,7 +156,8 @@ def acquire_lock():
     locked = False
     try:
         try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB); locked = True
+            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
         except BlockingIOError:
             log.warning("Another instance running. Exit.")
         yield locked
@@ -157,14 +169,12 @@ def acquire_lock():
 
 
 # ===========================================================================
-# WEEKEND + SESSION (v25.1)
+# SESSION / TIME
 # ===========================================================================
 def is_weekend() -> bool:
-    """Sab-Min WIB = OFF. Mon-Fri = active 24h."""
     return now_wib().weekday() >= 5
 
 def is_friday_cutoff() -> bool:
-    """Friday cutoff — avoid weekend gap."""
     now = now_wib()
     return now.weekday() == 4 and now.hour >= CONFIG.friday_cutoff_hour
 
@@ -198,17 +208,21 @@ def is_high_impact_news_time() -> bool:
 # STATE
 # ===========================================================================
 DEFAULT_STATE = {
-    "version": 251,
+    "version": 252,
     "last_signal_time": None,
     "last_choppy_time": None,
     "daily_signals_count": 0,
     "daily_pnl_usd": 0.0,
     "last_reset_date": None,
+    "last_report_date": None,
+    "last_weekly_date": None,
     "active_signals": [],
     "performance_history": {"wins": 0, "losses": 0},
-    "adaptive_threshold": CONFIG.base_min_signal_probability,
+    "adaptive_threshold": 0.60,
     "recent_outcomes": [],
     "trade_journal": [],
+    "session_outcomes": {},
+    "last_model_metrics": {},
 }
 
 def _req_sig_keys(s: dict) -> bool:
@@ -218,7 +232,7 @@ def _merge_defaults(state: dict) -> dict:
     for k, v in DEFAULT_STATE.items():
         if k not in state:
             state[k] = json.loads(json.dumps(v))
-    state["version"] = 251
+    state["version"] = 252
     state["active_signals"] = [s for s in state.get("active_signals", [])
                                 if isinstance(s, dict) and _req_sig_keys(s)]
     return state
@@ -228,9 +242,11 @@ def load_gist_state() -> dict:
     if not CONFIG.gist_token or not CONFIG.gist_id:
         return _merge_defaults({"last_reset_date": today})
     try:
-        r = requests.get(f"https://api.github.com/gists/{CONFIG.gist_id}",
-                          headers={"Authorization": f"token {CONFIG.gist_token}"},
-                          timeout=15)
+        r = requests.get(
+            f"https://api.github.com/gists/{CONFIG.gist_id}",
+            headers={"Authorization": f"token {CONFIG.gist_token}"},
+            timeout=15,
+        )
         if r.status_code == 200:
             for fn, fc in r.json().get("files", {}).items():
                 if fn.endswith("bot_state.json"):
@@ -270,7 +286,7 @@ def reset_daily_state_if_needed(state: dict) -> dict:
 
 
 # ===========================================================================
-# CLEANUP EXPIRED (weekend-safe — no market data needed)
+# SIGNAL EVALUATION
 # ===========================================================================
 def cleanup_expired_signals(state: dict) -> dict:
     now = now_utc()
@@ -280,8 +296,12 @@ def cleanup_expired_signals(state: dict) -> dict:
         try:
             exp = datetime.fromisoformat(sig["expires_at"])
             if now > exp:
-                log.info("Signal expired (cleanup): %s @ %s", sig["type"], sig["time"][:16])
+                log.info("Signal expired: %s @ %s", sig["type"], sig["time"][:16])
                 outcomes.append("timeout")
+                sess = sig.get("session", "UNKNOWN")
+                so = state.setdefault("session_outcomes", {}).setdefault(
+                    sess, {"wins": 0, "losses": 0, "timeouts": 0})
+                so["timeouts"] += 1
             else:
                 remaining.append(sig)
         except Exception:
@@ -290,45 +310,45 @@ def cleanup_expired_signals(state: dict) -> dict:
     state["recent_outcomes"] = outcomes[-50:]
     return state
 
-
-# ===========================================================================
-# ACTIVE SIGNAL EVALUATION
-# ===========================================================================
 def evaluate_active_signals(df: pd.DataFrame, state: dict) -> dict:
     active = state.get("active_signals", [])
     if not active:
         return state
-
     wins = state["performance_history"]["wins"]
     losses = state["performance_history"]["losses"]
     pnl = state.get("daily_pnl_usd", 0.0)
     recent = state.get("recent_outcomes", [])
-
     remaining = []
+
     for sig in active:
         try:
             sig_time = pd.Timestamp(sig["time"])
             expires_at = pd.Timestamp(sig["expires_at"])
         except Exception:
             continue
-
         mask = (df["datetime"] > sig_time) & (df["datetime"] <= expires_at)
         bars = df.loc[mask]
         if bars.empty:
-            remaining.append(sig); continue
+            remaining.append(sig)
+            continue
 
         result = None
         for _, bar in bars.iterrows():
             if sig["type"] == "BUY":
-                hit_tp = bar["high"] >= sig["tp"]; hit_sl = bar["low"] <= sig["sl"]
+                hit_tp = bar["high"] >= sig["tp"]
+                hit_sl = bar["low"] <= sig["sl"]
             else:
-                hit_tp = bar["low"] <= sig["tp"]; hit_sl = bar["high"] >= sig["sl"]
+                hit_tp = bar["low"] <= sig["tp"]
+                hit_sl = bar["high"] >= sig["sl"]
             if hit_sl:
-                result = "loss"; break
+                result = "loss"
+                break
             if hit_tp:
-                result = "win"; break
+                result = "win"
+                break
         if result is None:
-            remaining.append(sig); continue
+            remaining.append(sig)
+            continue
 
         lot, entry = float(sig["lot"]), float(sig["entry"])
         if result == "win":
@@ -342,6 +362,14 @@ def evaluate_active_signals(df: pd.DataFrame, state: dict) -> dict:
             pnl += move * lot * CONFIG.contract_size
             log.info("❌ LOSS %s (%.2f USD)", sig["type"], move * lot * CONFIG.contract_size)
         recent.append(result)
+
+        sess = sig.get("session", "UNKNOWN")
+        so = state.setdefault("session_outcomes", {}).setdefault(
+            sess, {"wins": 0, "losses": 0, "timeouts": 0})
+        if result == "win":
+            so["wins"] += 1
+        else:
+            so["losses"] += 1
 
     state["active_signals"] = remaining
     state["performance_history"]["wins"] = wins
@@ -361,9 +389,6 @@ def evaluate_active_signals(df: pd.DataFrame, state: dict) -> dict:
     return state
 
 
-# ===========================================================================
-# KILL SWITCH
-# ===========================================================================
 def check_kill_switch(state: dict) -> bool:
     if os.path.exists(CONFIG.kill_switch_path):
         log.critical("🛑 KILL SWITCH file found.")
@@ -375,14 +400,17 @@ def check_kill_switch(state: dict) -> bool:
         if len(decided) >= 10:
             wr = sum(1 for t in decided if t == "win") / len(decided)
             if wr < CONFIG.min_rolling_winrate:
-                log.critical("🛑 Rolling WR %.1f%% < %.0f%%.", wr*100, CONFIG.min_rolling_winrate*100)
+                log.critical("🛑 Rolling WR %.1f%%.", wr * 100)
                 return True
     consec = 0
     for t in reversed(recent):
-        if t == "loss": consec += 1
-        elif t == "win": break
+        if t == "loss":
+            consec += 1
+        elif t == "win":
+            break
     if consec >= CONFIG.max_consecutive_losses:
-        log.critical("🛑 %d consecutive losses.", consec); return True
+        log.critical("🛑 %d consecutive losses.", consec)
+        return True
     return False
 
 
@@ -400,7 +428,8 @@ def send_telegram(message: str) -> bool:
     for attempt in range(1, 4):
         try:
             r = requests.post(url, json=payload, timeout=10)
-            if r.status_code == 200: return True
+            if r.status_code == 200:
+                return True
             if r.status_code == 429:
                 py_time.sleep(int(r.json().get("parameters", {}).get("retry_after", 5)) + 1)
                 continue
@@ -422,11 +451,13 @@ def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFr
             r.raise_for_status()
             data = r.json()
             result = data.get("chart", {}).get("result")
-            if not result: raise ValueError("Yahoo empty")
+            if not result:
+                raise ValueError("Yahoo empty")
             res = result[0]
             ts = res.get("timestamp", [])
             quote = res.get("indicators", {}).get("quote", [{}])[0]
-            if not ts or not quote: raise ValueError("Yahoo missing fields")
+            if not ts or not quote:
+                raise ValueError("Yahoo missing fields")
             df = pd.DataFrame({
                 "epoch": ts,
                 "open": quote.get("open"), "high": quote.get("high"),
@@ -448,69 +479,94 @@ def fetch_candles(interval: str = "15m", range_period: str = "60d") -> pd.DataFr
             py_time.sleep(2 * attempt)
     raise RuntimeError("Fetch failed")
 
+
 def sanitize_and_trim(df):
-    if df is None or len(df) < 2: return None
+    if df is None or len(df) < 2:
+        return None
     df = df.drop_duplicates(subset="datetime")
     df = df[(df["high"] >= df["low"]) & (df["close"] > 0) & (df["open"] > 0)]
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open","high","low","close"])
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["open", "high", "low", "close"])
     df = df.sort_values("datetime").reset_index(drop=True)
-    if len(df) < 2: return None
+    if len(df) < 2:
+        return None
     age_min = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
     if age_min > CONFIG.timeframe_minutes * 3:
-        log.warning("Stale data (%.0f min).", age_min); return None
+        log.warning("Stale data (%.0f min).", age_min)
+        return None
     if age_min < CONFIG.timeframe_minutes:
         df = df.iloc[:-1].reset_index(drop=True)
-    if len(df) < CONFIG.min_candles: return None
+    if len(df) < CONFIG.min_candles:
+        return None
     return df
+
 
 def check_h1_trend_confluence() -> str:
     try:
         df = fetch_candles(interval="1h", range_period="60d")
-        if df is None or len(df) < 250: return "UNKNOWN"
+        if df is None or len(df) < 250:
+            return "UNKNOWN"
         df["ema50"] = df["close"].ewm(span=50, min_periods=50, adjust=False).mean()
         df["ema200"] = df["close"].ewm(span=200, min_periods=200, adjust=False).mean()
         c, e50, e200 = df["close"].iloc[-2], df["ema50"].iloc[-2], df["ema200"].iloc[-2]
-        if pd.isna(e200): return "UNKNOWN"
-        if c > e50 > e200: return "BUY"
-        if c < e50 < e200: return "SELL"
+        if pd.isna(e200):
+            return "UNKNOWN"
+        if c > e50 > e200:
+            return "BUY"
+        if c < e50 < e200:
+            return "SELL"
         return "NEUTRAL"
     except Exception as e:
-        log.warning("H1 error: %s", e); return "UNKNOWN"
+        log.warning("H1 error: %s", e)
+        return "UNKNOWN"
 
 
 # ===========================================================================
 # FEATURES
 # ===========================================================================
 def kalman_filter_1d(values, q=0.01, r=1.0):
-    n = len(values); est, vel, err = np.zeros(n), np.zeros(n), np.zeros(n)
+    n = len(values)
+    est, vel, err = np.zeros(n), np.zeros(n), np.zeros(n)
     est[0], vel[0], err[0] = values[0], 0.0, 1.0
     for i in range(1, n):
-        pe = est[i-1] + vel[i-1]; per = err[i-1] + q
+        pe = est[i - 1] + vel[i - 1]
+        per = err[i - 1] + q
         kg = per / (per + r + 1e-12)
         est[i] = pe + kg * (values[i] - pe)
-        vel[i] = 0.85 * vel[i-1] + 0.15 * (est[i] - est[i-1])
+        vel[i] = 0.85 * vel[i - 1] + 0.15 * (est[i] - est[i - 1])
         err[i] = (1 - kg) * per
     return est, vel, err
 
+
 def hurst_exponent(series, max_lag=20):
-    s = np.asarray(series, dtype=float); s = s[np.isfinite(s)]
-    if len(s) < max_lag * 2: return 0.5
+    s = np.asarray(series, dtype=float)
+    s = s[np.isfinite(s)]
+    if len(s) < max_lag * 2:
+        return 0.5
     lags = np.arange(2, max_lag + 1)
     tau = np.array([np.std(s[lag:] - s[:-lag]) for lag in lags], dtype=float)
     valid = tau > 0
-    if valid.sum() < 3: return 0.5
+    if valid.sum() < 3:
+        return 0.5
     try:
         poly = np.polyfit(np.log(lags[valid]), np.log(tau[valid]), 1)
         return float(np.clip(poly[0], 0.0, 1.0))
-    except Exception: return 0.5
+    except Exception:
+        return 0.5
+
 
 def shannon_entropy(returns, bins=10):
-    r = np.asarray(returns, dtype=float); r = r[np.isfinite(r)]
-    if len(r) < 20: return 1.0
+    r = np.asarray(returns, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) < 20:
+        return 1.0
     hist, _ = np.histogram(r, bins=bins)
-    p = hist / (hist.sum() + 1e-12); p = p[p > 0]
-    e = -np.sum(p * np.log2(p)); mx = np.log2(bins)
+    p = hist / (hist.sum() + 1e-12)
+    p = p[p > 0]
+    e = -np.sum(p * np.log2(p))
+    mx = np.log2(bins)
     return float(e / mx) if mx > 0 else 1.0
+
 
 def wilder_atr(df, period=14):
     prev = df["close"].shift(1)
@@ -518,9 +574,11 @@ def wilder_atr(df, period=14):
                      (df["low"] - prev).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
+
 def calculate_adx(df, period=14):
     df = df.copy()
-    up = df["high"].diff(); dn = -df["low"].diff()
+    up = df["high"].diff()
+    dn = -df["low"].diff()
     pdm = np.where((up > dn) & (up > 0), up, 0.0)
     mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
     atr = wilder_atr(df, period)
@@ -532,8 +590,10 @@ def calculate_adx(df, period=14):
     df["adx"] = dx.ewm(alpha=1/period, adjust=False).mean()
     return df
 
+
 def calculate_market_structure(df):
-    df = df.copy(); sw = 5
+    df = df.copy()
+    sw = 5
     df["prior_high"] = df["high"].rolling(sw).max().shift(1)
     df["prior_low"] = df["low"].rolling(sw).min().shift(1)
     bos_up = (df["high"] > df["prior_high"]) & (df["close"] > df["prior_high"])
@@ -541,13 +601,16 @@ def calculate_market_structure(df):
     df["bos_score"] = np.where(bos_up, 1.0, np.where(bos_dn, -1.0, 0.0))
     sweep_up = (df["high"] > df["prior_high"]) & (df["close"] < df["prior_high"])
     sweep_dn = (df["low"] < df["prior_low"]) & (df["close"] > df["prior_low"])
-    df["liquidity_sweep_score"] = np.where(sweep_dn, 1.0, np.where(sweep_up, -1.0, 0.0))
+    df["liquidity_sweep_score"] = np.where(sweep_dn, 1.0,
+                                            np.where(sweep_up, -1.0, 0.0))
     return df
+
 
 def calculate_features(df):
     df = df.copy()
     d = df["close"].diff()
-    g = d.clip(lower=0).rolling(14).mean(); l = (-d.clip(upper=0)).rolling(14).mean()
+    g = d.clip(lower=0).rolling(14).mean()
+    l = (-d.clip(upper=0)).rolling(14).mean()
     df["rsi"] = 100 - 100 / (1 + g / (l + 1e-12))
     df["atr"] = wilder_atr(df, CONFIG.atr_period)
     df["atr_pct"] = df["atr"] / (df["close"] + 1e-12)
@@ -562,7 +625,8 @@ def calculate_features(df):
     df["kalman_trend"] = kv / (df["atr"].to_numpy() + 1e-12)
     df["kalman_deviation"] = (df["close"].to_numpy() - kp) / (df["atr"].to_numpy() + 1e-12)
     df = calculate_adx(df, CONFIG.atr_period)
-    m = df["close"].rolling(20).mean(); s = df["close"].rolling(20).std()
+    m = df["close"].rolling(20).mean()
+    s = df["close"].rolling(20).std()
     df["bb_position"] = (df["close"] - m) / (2 * s + 1e-12)
     km = df["close"].ewm(span=20, adjust=False).mean()
     kb = df["atr"].ewm(span=20, adjust=False).mean() * 2
@@ -571,23 +635,29 @@ def calculate_features(df):
     df["realized_vol"] = ret.rolling(20).std() * np.sqrt(24 * 60 / CONFIG.timeframe_minutes)
     df["vol_zscore"] = (df["realized_vol"] - df["realized_vol"].rolling(100).mean()) / (
         df["realized_vol"].rolling(100).std() + 1e-12)
-    logp = np.log(df["close"].to_numpy()); rarr = ret.to_numpy(); n = len(df)
-    h = np.full(n, 0.5); e = np.full(n, 1.0)
+    logp = np.log(df["close"].to_numpy())
+    rarr = ret.to_numpy()
+    n = len(df)
+    h = np.full(n, 0.5)
+    e = np.full(n, 1.0)
     for i in range(100, n):
-        h[i] = hurst_exponent(logp[i-99:i+1])
-        e[i] = shannon_entropy(rarr[i-99:i+1])
-    df["hurst"] = h; df["shannon_entropy"] = e
+        h[i] = hurst_exponent(logp[i - 99:i + 1])
+        e[i] = shannon_entropy(rarr[i - 99:i + 1])
+    df["hurst"] = h
+    df["shannon_entropy"] = e
     rng = (df["high"] - df["low"]).replace(0, np.nan)
     df["body_ratio"] = (df["close"] - df["open"]).abs() / (rng + 1e-12)
-    df["upper_wick_ratio"] = (df["high"] - df[["open","close"]].max(axis=1)) / (rng + 1e-12)
-    df["lower_wick_ratio"] = (df[["open","close"]].min(axis=1) - df["low"]) / (rng + 1e-12)
+    df["upper_wick_ratio"] = (df["high"] - df[["open", "close"]].max(axis=1)) / (rng + 1e-12)
+    df["lower_wick_ratio"] = (df[["open", "close"]].min(axis=1) - df["low"]) / (rng + 1e-12)
     df = calculate_market_structure(df)
     df["return_1"] = df["close"].pct_change(1)
     df["return_3"] = df["close"].pct_change(3)
     df["return_5"] = df["close"].pct_change(5)
-    df["volume_zscore"] = 0.0; df["volume_ratio"] = 1.0
+    df["volume_zscore"] = 0.0
+    df["volume_ratio"] = 1.0
     if "volume" in df.columns and df["volume"].notna().sum() > 20:
-        v = df["volume"].fillna(0); sd = v.rolling(20).std()
+        v = df["volume"].fillna(0)
+        sd = v.rolling(20).std()
         df["volume_zscore"] = ((v - v.rolling(20).mean()) / (sd + 1e-12)).clip(-5, 5)
         df["volume_ratio"] = (v / (v.rolling(20).mean() + 1e-12)).clip(0, 10)
     hr = df["datetime"].dt.hour
@@ -604,14 +674,22 @@ def triple_barrier_labels(df, fwd, atr_mult):
     df = df.copy()
     c, h, l, a = (df["close"].to_numpy(), df["high"].to_numpy(),
                    df["low"].to_numpy(), df["atr"].to_numpy())
-    n = len(df); labels = np.zeros(n, dtype=int)
+    n = len(df)
+    labels = np.zeros(n, dtype=int)
     for i in range(n):
-        if i + fwd >= n: continue
-        up = c[i] + a[i] * atr_mult; dn = c[i] - a[i] * atr_mult
+        if i + fwd >= n:
+            continue
+        up = c[i] + a[i] * atr_mult
+        dn = c[i] - a[i] * atr_mult
         for j in range(i + 1, i + fwd + 1):
-            if h[j] >= up: labels[i] = 1; break
-            if l[j] <= dn: labels[i] = -1; break
-    df["label"] = labels; return df
+            if h[j] >= up:
+                labels[i] = 1
+                break
+            if l[j] <= dn:
+                labels[i] = -1
+                break
+    df["label"] = labels
+    return df
 
 
 # ===========================================================================
@@ -633,22 +711,29 @@ def build_light_model():
                                       subsample=0.8, random_state=42)
     return VotingClassifier([("rf", rf), ("gb", gb)], voting="soft")
 
+
 def purged_wf_validation(X, y):
     tscv = TimeSeriesSplit(n_splits=CONFIG.wf_splits)
     aucs, precs = [], []
     for tr_idx, va_idx in tscv.split(X):
         tr_end = tr_idx[-1] - CONFIG.forward_bars
-        if tr_end < 100: continue
+        if tr_end < 100:
+            continue
         tr_slice = np.arange(tr_idx[0], tr_end + 1)
-        if len(np.unique(y[tr_slice])) < 2: continue
+        if len(np.unique(y[tr_slice])) < 2:
+            continue
         try:
-            m = build_light_model(); m.fit(X[tr_slice], y[tr_slice])
-            proba = m.predict_proba(X[va_idx]); preds = m.predict(X[va_idx])
+            m = build_light_model()
+            m.fit(X[tr_slice], y[tr_slice])
+            proba = m.predict_proba(X[va_idx])
+            preds = m.predict(X[va_idx])
             dmask = y[va_idx] != 0
-            if dmask.sum() < 10: continue
+            if dmask.sum() < 10:
+                continue
             y_dir, p_dir = y[va_idx][dmask], preds[dmask]
             if len(np.unique(y_dir)) >= 2:
-                precs.append(precision_score(y_dir, p_dir, average="macro", zero_division=0))
+                precs.append(precision_score(y_dir, p_dir, average="macro",
+                                              zero_division=0))
             classes = list(m.classes_)
             if 1 in classes and -1 in classes:
                 bi, si = classes.index(1), classes.index(-1)
@@ -662,24 +747,32 @@ def purged_wf_validation(X, y):
     return {"valid": True, "auc_mean": float(np.mean(aucs)),
             "prec_mean": float(np.mean(precs)) if precs else 0.0}
 
+
 def generate_oof(X, y, n_splits=3, purge=4):
     oof = np.full(len(y), 0, dtype=int)
     tscv = TimeSeriesSplit(n_splits=n_splits)
     for tr_idx, va_idx in tscv.split(X):
         tr_end = tr_idx[-1] - purge
-        if tr_end < 100: continue
+        if tr_end < 100:
+            continue
         tr_slice = np.arange(tr_idx[0], tr_end + 1)
-        if len(np.unique(y[tr_slice])) < 2: continue
+        if len(np.unique(y[tr_slice])) < 2:
+            continue
         try:
-            m = build_base_model(); m.fit(X[tr_slice], y[tr_slice])
+            m = build_base_model()
+            m.fit(X[tr_slice], y[tr_slice])
             oof[va_idx] = m.predict(X[va_idx])
-        except Exception: pass
+        except Exception:
+            pass
     return oof
 
+
 def _train_meta_models(df_train, run_wf_gate=True):
-    df_lab = triple_barrier_labels(df_train, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
+    df_lab = triple_barrier_labels(df_train, CONFIG.forward_bars,
+                                     CONFIG.atr_sl_multiplier)
     train_df = df_lab.iloc[:-CONFIG.forward_bars]
-    X = train_df[FEATURES].to_numpy(); y = train_df["label"].to_numpy()
+    X = train_df[FEATURES].to_numpy()
+    y = train_df["label"].to_numpy()
     if len(X) < CONFIG.min_train_samples or len(np.unique(y)) < 2:
         return {"valid": False, "reason": "insufficient_data"}
     wf = None
@@ -687,36 +780,44 @@ def _train_meta_models(df_train, run_wf_gate=True):
         wf = purged_wf_validation(X, y)
         if (not wf["valid"] or wf["auc_mean"] < CONFIG.wf_min_auc
                 or wf["prec_mean"] < CONFIG.wf_min_prec):
-            return {"valid": False, "reason": f"wf_gate_{wf.get('auc_mean',0):.2f}"}
+            return {"valid": False,
+                    "reason": f"wf_gate_{wf.get('auc_mean', 0):.2f}"}
     oof = generate_oof(X, y, CONFIG.meta_oof_splits, CONFIG.forward_bars)
     meta_mask = (oof != 0) & (y != 0)
     if meta_mask.sum() < 150:
         return {"valid": False, "reason": "insufficient_meta"}
-    X_meta, y_meta = X[meta_mask], (y[meta_mask] == oof[meta_mask]).astype(int)
+    X_meta = X[meta_mask]
+    y_meta = (y[meta_mask] == oof[meta_mask]).astype(int)
     if len(np.unique(y_meta)) < 2 or not (0.30 <= y_meta.mean() <= 0.70):
         return {"valid": False, "reason": "meta_unbalanced"}
-    split = int(len(X_meta) * 0.8); tr_end = split - CONFIG.forward_bars
+    split = int(len(X_meta) * 0.8)
+    tr_end = split - CONFIG.forward_bars
     if tr_end < 100:
         return {"valid": False, "reason": "insufficient_meta_train"}
-    meta_val = RandomForestClassifier(n_estimators=150, max_depth=6, min_samples_leaf=20,
-                                        class_weight="balanced", random_state=42, n_jobs=-1)
+    meta_val = RandomForestClassifier(n_estimators=150, max_depth=6,
+                                        min_samples_leaf=20, class_weight="balanced",
+                                        random_state=42, n_jobs=-1)
     meta_val.fit(X_meta[:tr_end], y_meta[:tr_end])
     meta_prob_te = meta_val.predict_proba(X_meta[split:])[:, 1]
     try:
         meta_auc = roc_auc_score(y_meta[split:], meta_prob_te)
-    except Exception: meta_auc = 0.5
+    except Exception:
+        meta_auc = 0.5
     meta_brier = brier_score_loss(y_meta[split:], meta_prob_te)
     if meta_auc < CONFIG.meta_min_auc or meta_brier > CONFIG.meta_max_brier:
         return {"valid": False, "reason": f"meta_gate_auc{meta_auc:.2f}"}
     weights = np.exp(-np.arange(len(y))[::-1] / 500.0)
-    primary = build_base_model(); primary.fit(X, y, sample_weight=weights)
-    meta = RandomForestClassifier(n_estimators=150, max_depth=6, min_samples_leaf=20,
-                                    class_weight="balanced", random_state=42, n_jobs=-1)
+    primary = build_base_model()
+    primary.fit(X, y, sample_weight=weights)
+    meta = RandomForestClassifier(n_estimators=150, max_depth=6,
+                                    min_samples_leaf=20, class_weight="balanced",
+                                    random_state=42, n_jobs=-1)
     meta.fit(X_meta, y_meta, sample_weight=weights[meta_mask])
     return {"valid": True, "primary": primary, "meta": meta,
             "meta_auc": meta_auc, "meta_brier": meta_brier,
             "wf_auc": wf["auc_mean"] if wf else 0.5,
             "wf_prec": wf["prec_mean"] if wf else 0.0}
+
 
 def predict_from_models(df_row, models):
     if not models.get("valid") or "primary" not in models:
@@ -741,33 +842,44 @@ def predict_from_models(df_row, models):
 # ===========================================================================
 def load_cached_models(fp):
     try:
-        if not os.path.exists(CONFIG.model_cache_path): return None
-        with open(CONFIG.model_cache_path, "rb") as f: cache = pickle.load(f)
-        if cache.get("fingerprint") != fp: return None
+        if not os.path.exists(CONFIG.model_cache_path):
+            return None
+        with open(CONFIG.model_cache_path, "rb") as f:
+            cache = pickle.load(f)
+        if cache.get("fingerprint") != fp:
+            return None
         age = (py_time.time() - cache["ts"]) / 60
-        if age > CONFIG.model_cache_ttl_min: return None
+        if age > CONFIG.model_cache_ttl_min:
+            return None
         log.info("Cache HIT (%.0fm)", age)
         return cache["payload"]
     except Exception as e:
-        log.warning("Cache load: %s", e); return None
+        log.warning("Cache load: %s", e)
+        return None
+
 
 def save_cached_models(fp, payload):
     try:
         with open(CONFIG.model_cache_path, "wb") as f:
-            pickle.dump({"fingerprint": fp, "payload": payload, "ts": py_time.time()}, f)
+            pickle.dump({"fingerprint": fp, "payload": payload,
+                         "ts": py_time.time()}, f)
     except Exception as e:
         log.warning("Cache save: %s", e)
 
+
 def model_fingerprint(df_feat):
-    return f"v251_{df_feat['datetime'].iloc[-1].floor('h').isoformat()}"
+    return f"v252_{df_feat['datetime'].iloc[-1].floor('h').isoformat()}"
+
 
 def get_or_train_models(df_feat, use_cache=True):
     fp = model_fingerprint(df_feat)
     if use_cache:
         cached = load_cached_models(fp)
-        if cached is not None: return cached
+        if cached is not None:
+            return cached
     models = _train_meta_models(df_feat, run_wf_gate=True)
-    if models.get("valid"): save_cached_models(fp, models)
+    if models.get("valid"):
+        save_cached_models(fp, models)
     return models
 
 
@@ -776,7 +888,8 @@ def get_or_train_models(df_feat, use_cache=True):
 # ===========================================================================
 def check_vol_regime(df_feat):
     rv = df_feat["realized_vol"].dropna()
-    if len(rv) < 200: return True, 0.5
+    if len(rv) < 200:
+        return True, 0.5
     pct = float((rv.tail(200) <= rv.iloc[-1]).mean())
     if pct < CONFIG.vol_regime_min_pct or pct > CONFIG.vol_regime_max_pct:
         return False, pct
@@ -789,7 +902,8 @@ def check_vol_regime(df_feat):
 def compute_trade(sig_type, df_feat, prob, meta_prob, state):
     last = df_feat.iloc[-1]
     price, atr = float(last["close"]), float(last["atr"])
-    sl_dist, tp_dist = atr * CONFIG.atr_sl_multiplier, atr * CONFIG.atr_sl_multiplier * CONFIG.risk_reward
+    sl_dist = atr * CONFIG.atr_sl_multiplier
+    tp_dist = sl_dist * CONFIG.risk_reward
     if sig_type == "BUY":
         sl, tp = price - sl_dist - CONFIG.spread_usd, price + tp_dist
     else:
@@ -799,8 +913,10 @@ def compute_trade(sig_type, df_feat, prob, meta_prob, state):
     meta_boost = max(0.5, min(meta_prob / max(CONFIG.meta_min_probability, 1e-9), 1.3))
     session_mult = get_session_risk_multiplier()
     risk_pct = max(
-        min(CONFIG.risk_percent * ratio * meta_boost * session_mult, CONFIG.max_risk_percent),
-        CONFIG.min_risk_percent * session_mult)
+        min(CONFIG.risk_percent * ratio * meta_boost * session_mult,
+            CONFIG.max_risk_percent),
+        CONFIG.min_risk_percent * session_mult,
+    )
     risk_usd = CONFIG.account_equity * risk_pct / 100.0
     sl_dist_abs = abs(price - sl)
     if sl_dist_abs <= 0:
@@ -808,25 +924,33 @@ def compute_trade(sig_type, df_feat, prob, meta_prob, state):
     else:
         lot = max(min(round(risk_usd / (sl_dist_abs * CONFIG.contract_size), 2),
                        CONFIG.max_lot), CONFIG.min_lot)
-    expires = now_utc() + timedelta(minutes=CONFIG.timeframe_minutes * CONFIG.forward_bars * 2)
+    expires = now_utc() + timedelta(
+        minutes=CONFIG.timeframe_minutes * CONFIG.forward_bars * 2)
     return {
-        "type": sig_type, "entry": round(price, 2), "sl": round(sl, 2), "tp": round(tp, 2),
-        "lot": lot, "risk_pct": round(risk_pct, 2), "risk_usd": round(risk_usd, 2),
-        "prob": prob, "meta_prob": meta_prob, "session": get_current_session(),
-        "time": now_utc().isoformat(), "expires_at": expires.isoformat(),
+        "type": sig_type, "entry": round(price, 2), "sl": round(sl, 2),
+        "tp": round(tp, 2), "lot": lot, "risk_pct": round(risk_pct, 2),
+        "risk_usd": round(risk_usd, 2), "prob": prob, "meta_prob": meta_prob,
+        "session": get_current_session(), "time": now_utc().isoformat(),
+        "expires_at": expires.isoformat(),
     }
+
 
 def has_conflicting_signal(state, new_type):
     now = now_utc()
     for s in state.get("active_signals", []):
-        if not s.get("type"): continue
-        if s["type"] != new_type: return True
+        if not s.get("type"):
+            continue
+        if s["type"] != new_type:
+            return True
         try:
             st = datetime.fromisoformat(s["time"])
             if (now - st).total_seconds() < 3600:
-                log.info("Duplicate %s within 60 min.", new_type); return True
-        except Exception: pass
+                log.info("Duplicate %s within 60 min.", new_type)
+                return True
+        except Exception:
+            pass
     return False
+
 
 def append_trade_journal(trade, df_feat, state):
     last = df_feat.iloc[-1]
@@ -835,30 +959,292 @@ def append_trade_journal(trade, df_feat, state):
         "candle_ts": last["datetime"].isoformat(),
         "type": trade["type"], "session": trade.get("session", "UNKNOWN"),
         "entry": trade["entry"], "sl": trade["sl"], "tp": trade["tp"],
-        "lot": trade["lot"], "prob": trade["prob"], "meta_prob": trade.get("meta_prob", 0),
+        "lot": trade["lot"], "prob": trade["prob"],
+        "meta_prob": trade.get("meta_prob", 0),
         "features": {f: float(last[f]) for f in FEATURES if pd.notna(last.get(f))},
     }
-    j = state.get("trade_journal", []); j.append(entry)
+    j = state.get("trade_journal", [])
+    j.append(entry)
     state["trade_journal"] = j[-CONFIG.max_journal_entries:]
 
-def format_message(trade, h1, hurst, entropy, wick, time_str, meta):
+
+def format_signal_message(trade, h1, hurst, entropy, wick, time_str, meta):
     emoji = "🟢" if trade["type"] == "BUY" else "🔴"
     return (
-        f"<b>{emoji} XAUUSD {trade['type']} [{trade.get('session','?')}]</b>\n"
+        f"<b>{emoji} XAUUSD {trade['type']} [{trade.get('session', '?')}]</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕒 {time_str}\n"
         f"🎯 Primary: {trade['prob']*100:.1f}% | 🧠 Meta: {trade['meta_prob']*100:.1f}%\n"
         f"📊 H1: {h1} | 🌊 Hurst {hurst:.2f} Ent {entropy:.2f}\n"
         f"🕯️ Wick: {wick*100:.0f}%\n"
-        f"📈 OOS: AUC {meta.get('meta_auc',0):.3f} Brier {meta.get('meta_brier',0):.3f}\n"
+        f"📈 OOS: AUC {meta.get('meta_auc', 0):.3f} Brier {meta.get('meta_brier', 0):.3f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry: {trade['entry']:.2f}\n"
         f"🛑 SL: {trade['sl']:.2f}\n"
         f"🎯 TP: {trade['tp']:.2f}\n"
         f"⚖️ Lot: {trade['lot']} (Risk {trade['risk_pct']:.1f}% = ${trade['risk_usd']:.2f})\n"
         f"💵 Offset: -{CONFIG.price_offset}\n"
-        f"<i>Expires: {trade['expires_at'][:16].replace('T',' ')} UTC</i>"
+        f"<i>Expires: {trade['expires_at'][:16].replace('T', ' ')} UTC</i>"
     )
+
+
+# ===========================================================================
+# MONITOR — daily/weekly report (integrated)
+# ===========================================================================
+def is_monitor_due(state: dict) -> bool:
+    now = now_wib()
+    if now.weekday() >= 5:
+        return False
+    today = now.strftime("%Y-%m-%d")
+    if state.get("last_report_date") == today:
+        return False
+    if now.hour < CONFIG.monitor_hour_wib:
+        return False
+    return True
+
+
+def _wr_badge(wr: float) -> str:
+    if wr >= 0.60: return "✅"
+    if wr >= 0.50: return "🟡"
+    if wr >= 0.40: return "🟠"
+    return "🔴"
+
+
+def _compute_monitor_metrics(state: dict) -> dict:
+    perf = state.get("performance_history", {})
+    wins = perf.get("wins", 0)
+    losses = perf.get("losses", 0)
+    total = wins + losses
+    wr = wins / total if total > 0 else 0.0
+
+    recent = state.get("recent_outcomes", [])
+    roll_window = recent[-20:]
+    roll_decided = [t for t in roll_window if t in ("win", "loss")]
+    roll_wr = (sum(1 for t in roll_decided if t == "win") / len(roll_decided)
+                if roll_decided else 0.0)
+
+    consec = 0
+    for t in reversed(recent):
+        if t == "loss":
+            consec += 1
+        elif t == "win":
+            break
+
+    sess_out = state.get("session_outcomes", {})
+    sess_breakdown = []
+    for sess in ("LONDON", "NEWYORK", "ASIAN", "LATE"):
+        d = sess_out.get(sess, {})
+        w, l, t = d.get("wins", 0), d.get("losses", 0), d.get("timeouts", 0)
+        n = w + l
+        sess_breakdown.append({
+            "session": sess, "wins": w, "losses": l, "timeouts": t,
+            "trades": n, "win_rate": w / n if n > 0 else 0.0,
+        })
+
+    journal = state.get("trade_journal", [])
+    sess_signal_dist = {}
+    for j in journal:
+        s = j.get("session", "UNKNOWN")
+        sess_signal_dist[s] = sess_signal_dist.get(s, 0) + 1
+
+    return {
+        "wins": wins, "losses": losses, "total": total, "win_rate": wr,
+        "roll_wr": roll_wr, "roll_n": len(roll_decided),
+        "consec_losses": consec,
+        "active_n": len(state.get("active_signals", [])),
+        "active": state.get("active_signals", []),
+        "journal_n": len(journal),
+        "recent_10": recent[-10:],
+        "sess_breakdown": sess_breakdown,
+        "sess_signal_dist": sess_signal_dist,
+        "model_metrics": state.get("last_model_metrics", {}),
+        "daily_pnl": state.get("daily_pnl_usd", 0.0),
+        "daily_signals": state.get("daily_signals_count", 0),
+        "adaptive_threshold": state.get("adaptive_threshold", 0.60),
+        "last_signal_time": state.get("last_signal_time"),
+    }
+
+
+def _compute_monitor_alerts(m: dict, state: dict) -> list:
+    alerts = []
+    if os.path.exists(CONFIG.kill_switch_path):
+        alerts.append("🔴 <b>KILL SWITCH FILE</b> aktif")
+    if m["consec_losses"] >= CONFIG.max_consecutive_losses:
+        alerts.append(f"🔴 <b>{m['consec_losses']} consecutive losses</b>")
+    elif m["consec_losses"] >= 3:
+        alerts.append(f"🟠 {m['consec_losses']} consecutive losses — waspada")
+    if m["roll_n"] >= 10:
+        if m["roll_wr"] < CONFIG.min_rolling_winrate:
+            alerts.append(f"🔴 Rolling WR {m['roll_wr']*100:.1f}%")
+        elif m["roll_wr"] < 0.45:
+            alerts.append(f"🟡 Rolling WR {m['roll_wr']*100:.1f}%")
+    th = m["adaptive_threshold"]
+    if th >= CONFIG.max_threshold:
+        alerts.append(f"🟠 Threshold stuck di {th:.2f}")
+    elif th >= 0.65:
+        alerts.append(f"🟡 Threshold {th:.2f} tinggi")
+    if m["total"] >= 20 and m["win_rate"] < 0.45:
+        alerts.append(f"🔴 Overall WR {m['win_rate']*100:.1f}% < 45%")
+    if not alerts:
+        alerts.append("🟢 Semua sistem normal")
+    return alerts
+
+
+def _format_monitor_daily(m: dict, alerts: list) -> str:
+    now = now_wib()
+    day_id = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"][now.weekday()]
+    parts = [
+        f"<b>📊 XAUUSD BOT — DAILY REPORT</b>",
+        f"🗓️ {now.strftime('%Y-%m-%d')} ({day_id}) {now.strftime('%H:%M')} WIB",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "<b>⚠️ SYSTEM ALERTS</b>",
+    ]
+    parts.extend(alerts)
+    parts.append("")
+    parts.append("<b>📈 PERFORMANCE (cumulative)</b>")
+    if m["total"] > 0:
+        parts.append(
+            f"Trades: <b>{m['total']}</b> (W:{m['wins']} L:{m['losses']}) "
+            f"{_wr_badge(m['win_rate'])} <b>{m['win_rate']*100:.1f}%</b>"
+        )
+        if m["roll_n"] >= 5:
+            parts.append(
+                f"Rolling last {m['roll_n']}: "
+                f"<b>{m['roll_wr']*100:.1f}%</b> {_wr_badge(m['roll_wr'])}"
+            )
+    else:
+        parts.append("Belum ada trade closed.")
+    parts.append("")
+    parts.append("<b>💰 HARI INI</b>")
+    pnl_emoji = "🟢" if m["daily_pnl"] >= 0 else "🔴"
+    parts.append(
+        f"PnL: {pnl_emoji} <b>${m['daily_pnl']:+.2f}</b> "
+        f"| Signals: <b>{m['daily_signals']}</b>"
+    )
+    parts.append("")
+
+    has_sess = any(s["trades"] > 0 or s["timeouts"] > 0 for s in m["sess_breakdown"])
+    if has_sess:
+        parts.append("<b>🎯 SESSION BREAKDOWN</b>")
+        for s in m["sess_breakdown"]:
+            if s["trades"] == 0 and s["timeouts"] == 0:
+                continue
+            emoji = SESSION_EMOJI.get(s["session"], "•")
+            wr_b = _wr_badge(s["win_rate"]) if s["trades"] > 0 else "—"
+            parts.append(
+                f"{emoji} {s['session']:<8} "
+                f"{s['trades']:>2} trades {wr_b} {s['win_rate']*100:>5.1f}%"
+                + (f" ({s['timeouts']}T)" if s["timeouts"] else "")
+            )
+        parts.append("")
+
+    if m["recent_10"]:
+        parts.append("<b>🕐 RECENT (last 10)</b>")
+        icons = "".join({"win": "✅", "loss": "❌", "timeout": "⏱️"}.get(t, "?")
+                         for t in m["recent_10"])
+        wins_10 = sum(1 for t in m["recent_10"] if t == "win")
+        parts.append(f"{icons} — {wins_10}/{len(m['recent_10'])} wins")
+        parts.append("")
+
+    mm = m["model_metrics"]
+    if mm:
+        parts.append("<b>🧠 MODEL HEALTH</b>")
+        parts.append(
+            f"Meta AUC: <b>{mm.get('meta_auc', 0):.3f}</b> "
+            f"| Brier: <b>{mm.get('meta_brier', 0):.3f}</b>"
+        )
+        parts.append(
+            f"WF AUC: {mm.get('wf_auc', 0):.3f} "
+            f"| WF Prec: {mm.get('wf_prec', 0):.3f}"
+        )
+        parts.append("")
+
+    parts.append("<b>⚙️ SYSTEM</b>")
+    parts.append(f"Adaptive Threshold: <b>{m['adaptive_threshold']:.2f}</b>")
+    if m["last_signal_time"]:
+        try:
+            lst = datetime.fromisoformat(m["last_signal_time"])
+            mins_ago = int((datetime.now(timezone.utc) - lst).total_seconds() / 60)
+            parts.append(f"Last signal: {mins_ago}m ago")
+        except Exception:
+            pass
+    parts.append(f"Active signals: {m['active_n']}")
+    parts.append("")
+    parts.append(f"<i>💵 Modal awal: ${CONFIG.account_equity:.2f}</i>")
+    return "\n".join(parts)
+
+
+def _format_monitor_weekly(m: dict) -> str:
+    now = now_wib()
+    parts = [
+        "<b>📅 XAUUSD BOT — WEEKLY REPORT</b>",
+        f"🗓️ Week ending {now.strftime('%d/%m/%Y')}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "<b>📊 RINGKASAN</b>",
+        f"Total closed: <b>{m['total']}</b>",
+        f"Overall WR: <b>{m['win_rate']*100:.1f}%</b> {_wr_badge(m['win_rate'])}",
+    ]
+    if m["sess_breakdown"] and any(s["trades"] >= 3 for s in m["sess_breakdown"]):
+        best = max(m["sess_breakdown"],
+                    key=lambda s: s["win_rate"] if s["trades"] >= 3 else 0)
+        parts.append(
+            f"Best session: <b>{best['session']}</b> "
+            f"({best['win_rate']*100:.0f}% dari {best['trades']})"
+        )
+    parts.append("")
+    parts.append("<b>💡 REKOMENDASI</b>")
+    if m["total"] < 10:
+        parts.append("⏳ Sample masih sedikit. Lanjut kumpulkan data.")
+    elif m["win_rate"] >= 0.55 and m["roll_n"] >= 10 and m["roll_wr"] >= 0.50:
+        parts.append("✅ Performa sehat. Pertimbangkan naikkan modal pelan.")
+    elif m["win_rate"] >= 0.45:
+        parts.append("🟡 Marginal. Pertahankan modal kecil, audit journal.")
+    elif m["win_rate"] < 0.40 and m["total"] >= 20:
+        parts.append("🔴 WR rendah. <b>STOP</b> dan jalankan backtest.")
+    else:
+        parts.append("🟠 Waspada. Kurangi risk atau pause sementara.")
+    return "\n".join(parts)
+
+
+def run_monitor(state: dict = None, force: bool = False, dry_run: bool = False):
+    if state is None:
+        state = load_gist_state()
+
+    if not force and not is_monitor_due(state):
+        log.info("Monitor not due (last_report=%s, hour=%d).",
+                 state.get("last_report_date"), now_wib().hour)
+        return
+
+    m = _compute_monitor_metrics(state)
+    alerts = _compute_monitor_alerts(m, state)
+    daily_msg = _format_monitor_daily(m, alerts)
+    is_monday = now_wib().weekday() == 0
+
+    if dry_run:
+        print("\n" + "=" * 60)
+        print(daily_msg)
+        print("=" * 60)
+        if is_monday:
+            print("\n" + "=" * 60)
+            print(_format_monitor_weekly(m))
+            print("=" * 60)
+        return
+
+    if not send_telegram(daily_msg):
+        log.error("Daily report send FAILED.")
+        return
+    log.info("✅ Daily report sent.")
+    state["last_report_date"] = now_wib().strftime("%Y-%m-%d")
+
+    if is_monday:
+        weekly_msg = _format_monitor_weekly(m)
+        if send_telegram(weekly_msg):
+            log.info("✅ Weekly report sent.")
+            state["last_weekly_date"] = now_wib().strftime("%Y-%m-%d")
+
+    save_gist_state(state)
 
 
 # ===========================================================================
@@ -869,74 +1255,116 @@ class BacktestConfig:
     initial_equity: float = 10_000.0
     risk_percent: float = 1.0
 
+
 class WalkForwardBacktest:
     def __init__(self, df_feat, cfg):
-        self.df = df_feat.reset_index(drop=True); self.cfg = cfg
+        self.df = df_feat.reset_index(drop=True)
+        self.cfg = cfg
         self.trades, self.equity_curve, self.equity = [], [], cfg.initial_equity
+
     def run(self):
-        n = len(self.df); start = CONFIG.min_train_samples + CONFIG.forward_bars
+        n = len(self.df)
+        start = CONFIG.min_train_samples + CONFIG.forward_bars
         models, last_retrain, skipped = None, -10**9, 0
         for i in range(start, n - CONFIG.forward_bars):
             if i - last_retrain >= CONFIG.backtest_retrain_every or models is None:
                 models = _train_meta_models(self.df.iloc[:i], run_wf_gate=False)
                 last_retrain = i
-                if not models.get("valid"): skipped += 1
-            if not models.get("valid"): self._rec(i); continue
+                if not models.get("valid"):
+                    skipped += 1
+            if not models.get("valid"):
+                self._rec(i)
+                continue
             pred = predict_from_models(self.df.iloc[[i]], models)
             side = pred.get("side", 0)
             if side == 0 or pred.get("meta_prob", 0) < CONFIG.meta_min_probability:
-                self._rec(i); continue
-            t = self._sim(i, side, pred); self.trades.append(t)
-            self.equity += t["pnl_usd"]; self._rec(i)
+                self._rec(i)
+                continue
+            t = self._sim(i, side)
+            self.trades.append(t)
+            self.equity += t["pnl_usd"]
+            self._rec(i)
         log.info("Backtest: %d trades, %d skips", len(self.trades), skipped)
         return self._report()
-    def _sim(self, i, direction, pred):
-        row = self.df.iloc[i]; entry = float(row["close"])
+
+    def _sim(self, i, direction):
+        row = self.df.iloc[i]
+        entry = float(row["close"])
         atr = float(row["atr"]) if pd.notna(row["atr"]) else 10.0
-        sl_dist = atr * CONFIG.atr_sl_multiplier; tp_dist = sl_dist * CONFIG.risk_reward
+        sl_dist = atr * CONFIG.atr_sl_multiplier
+        tp_dist = sl_dist * CONFIG.risk_reward
         if direction == 1:
-            entry_eff = entry + CONFIG.spread_usd/2 + CONFIG.slippage_usd
+            entry_eff = entry + CONFIG.spread_usd / 2 + CONFIG.slippage_usd
             sl, tp = entry - sl_dist, entry + tp_dist
         else:
-            entry_eff = entry - CONFIG.spread_usd/2 - CONFIG.slippage_usd
+            entry_eff = entry - CONFIG.spread_usd / 2 - CONFIG.slippage_usd
             sl, tp = entry + sl_dist, entry - tp_dist
         outcome, exit_price, exit_idx = "timeout", entry, i + CONFIG.forward_bars
-        for j in range(i+1, min(i+CONFIG.forward_bars+1, len(self.df))):
+        for j in range(i + 1, min(i + CONFIG.forward_bars + 1, len(self.df))):
             bar = self.df.iloc[j]
-            if direction == 1: hit_sl, hit_tp = bar["low"] <= sl, bar["high"] >= tp
-            else: hit_sl, hit_tp = bar["high"] >= sl, bar["low"] <= tp
-            if hit_sl: outcome, exit_price, exit_idx = "loss", sl, j; break
-            if hit_tp: outcome, exit_price, exit_idx = "win", tp, j; break
+            if direction == 1:
+                hit_sl = bar["low"] <= sl
+                hit_tp = bar["high"] >= tp
+            else:
+                hit_sl = bar["high"] >= sl
+                hit_tp = bar["low"] <= tp
+            if hit_sl:
+                outcome, exit_price, exit_idx = "loss", sl, j
+                break
+            if hit_tp:
+                outcome, exit_price, exit_idx = "win", tp, j
+                break
         else:
-            exit_price = float(self.df.iloc[min(i+CONFIG.forward_bars, len(self.df)-1)]["close"])
-        move = (exit_price - entry_eff) if direction == 1 else (entry_eff - exit_price)
+            exit_price = float(self.df.iloc[
+                min(i + CONFIG.forward_bars, len(self.df) - 1)]["close"])
+        move = ((exit_price - entry_eff) if direction == 1
+                else (entry_eff - exit_price))
         risk_usd = self.equity * self.cfg.risk_percent / 100.0
-        lot = max(CONFIG.min_lot, min(round(risk_usd/(sl_dist*CONFIG.contract_size), 2), CONFIG.max_lot))
+        lot = max(CONFIG.min_lot,
+                   min(round(risk_usd / (sl_dist * CONFIG.contract_size), 2),
+                       CONFIG.max_lot))
         pnl = move * lot * CONFIG.contract_size - lot * CONFIG.commission_per_lot * 2
         return {"entry_idx": i, "exit_idx": exit_idx, "direction": direction,
-                "entry": round(entry_eff,2), "exit": round(exit_price,2),
-                "sl": round(sl,2), "tp": round(tp,2), "lot": lot,
-                "outcome": outcome, "pnl_usd": round(pnl,2)}
-    def _rec(self, i): self.equity_curve.append({"bar": i, "equity": self.equity})
+                "entry": round(entry_eff, 2), "exit": round(exit_price, 2),
+                "sl": round(sl, 2), "tp": round(tp, 2), "lot": lot,
+                "outcome": outcome, "pnl_usd": round(pnl, 2)}
+
+    def _rec(self, i):
+        self.equity_curve.append({"bar": i, "equity": self.equity})
+
     def _report(self):
-        if not self.trades: return {"error": "no_trades"}
-        df = pd.DataFrame(self.trades); eq = pd.Series([e["equity"] for e in self.equity_curve])
-        wins, losses = df[df["outcome"]=="win"], df[df["outcome"]=="loss"]
-        n = len(df); wr = len(wins)/n if n else 0
-        pf = wins["pnl_usd"].sum() / abs(losses["pnl_usd"].sum()) if len(losses) and losses["pnl_usd"].sum() != 0 else 999
+        if not self.trades:
+            return {"error": "no_trades"}
+        df = pd.DataFrame(self.trades)
+        eq = pd.Series([e["equity"] for e in self.equity_curve])
+        wins = df[df["outcome"] == "win"]
+        losses = df[df["outcome"] == "loss"]
+        n = len(df)
+        wr = len(wins) / n if n else 0
+        pf = (wins["pnl_usd"].sum() / abs(losses["pnl_usd"].sum())
+              if len(losses) and losses["pnl_usd"].sum() != 0 else 999)
         ret = eq.pct_change().dropna()
-        sharpe = (ret.mean()/ret.std()*np.sqrt(96*252)) if len(ret)>1 and ret.std()>0 else 0
-        dd = (eq - eq.cummax())/eq.cummax(); max_dd = dd.min()
-        rng = np.random.default_rng(42); pnls = df["pnl_usd"].to_numpy()
-        boot = [self.cfg.initial_equity + rng.choice(pnls, len(pnls), replace=True).sum() for _ in range(1000)]
-        mc5, mc50, mc95 = np.percentile(boot, [5,50,95])
+        sharpe = (ret.mean() / ret.std() * np.sqrt(96 * 252)
+                  if len(ret) > 1 and ret.std() > 0 else 0)
+        dd = (eq - eq.cummax()) / eq.cummax()
+        max_dd = dd.min()
+        rng = np.random.default_rng(42)
+        pnls = df["pnl_usd"].to_numpy()
+        boot = [self.cfg.initial_equity +
+                rng.choice(pnls, len(pnls), replace=True).sum()
+                for _ in range(1000)]
+        mc5, mc50, mc95 = np.percentile(boot, [5, 50, 95])
         return {"trades": n, "wins": len(wins), "losses": len(losses),
-                "win_rate_pct": round(wr*100,2), "profit_factor": round(pf,3),
-                "sharpe": round(sharpe,2), "max_dd_pct": round(max_dd*100,2),
-                "final_equity": round(eq.iloc[-1],2),
-                "total_return_pct": round((eq.iloc[-1]/eq.iloc[0]-1)*100,2),
-                "mc_p5": round(mc5,2), "mc_p50": round(mc50,2), "mc_p95": round(mc95,2),
+                "win_rate_pct": round(wr * 100, 2),
+                "profit_factor": round(pf, 3),
+                "sharpe": round(sharpe, 2),
+                "max_dd_pct": round(max_dd * 100, 2),
+                "final_equity": round(eq.iloc[-1], 2),
+                "total_return_pct": round((eq.iloc[-1] / eq.iloc[0] - 1) * 100, 2),
+                "mc_p5": round(mc5, 2), "mc_p50": round(mc50, 2),
+                "mc_p95": round(mc95, 2),
                 "verdict": self._verdict(sharpe, pf, wr, max_dd)}
+
     @staticmethod
     def _verdict(sharpe, pf, wr, dd):
         if sharpe >= 1.0 and pf >= 1.5 and wr >= 0.50 and dd > -0.15:
@@ -947,157 +1375,184 @@ class WalkForwardBacktest:
 
 
 # ===========================================================================
-# MAIN
+# MAIN — BOT
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v25.1 — Weekday 24/7 Forensic-Hardened")
+    log.info("XAUUSD v25.2 — Combined Bot + Monitor")
     log.info("=" * 60)
 
     validate_config()
+
     with acquire_lock() as locked:
-        if not locked: return
+        if not locked:
+            return
 
         state = load_gist_state()
         state = reset_daily_state_if_needed(state)
-
-        # 1. ALWAYS cleanup expired (no data needed)
         state = cleanup_expired_signals(state)
 
-        # 2. Weekend check (WIB Sat/Sun)
         if is_weekend():
-            log.info("Weekend (Sab-Min WIB). Cleanup only, no new signals.")
-            save_gist_state(state); return
-
-        # 3. Friday cutoff
+            log.info("Weekend (Sab-Min WIB). Cleanup only.")
+            save_gist_state(state)
+            return
         if is_friday_cutoff():
-            log.info("Friday cutoff (>=%d:00 WIB). No new signals.", CONFIG.friday_cutoff_hour)
-            save_gist_state(state); return
-
-        # 4. Kill switch
+            log.info("Friday cutoff (>=%d:00 WIB).", CONFIG.friday_cutoff_hour)
+            save_gist_state(state)
+            return
         if check_kill_switch(state):
-            save_gist_state(state); return
-
-        # 5. Daily limits
+            save_gist_state(state)
+            return
         if state["daily_signals_count"] >= CONFIG.max_daily_signals:
-            log.info("Daily signal limit (%d).", CONFIG.max_daily_signals); return
+            log.info("Daily limit (%d).", CONFIG.max_daily_signals)
+            return
         max_loss = -CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0
         if state.get("daily_pnl_usd", 0) <= max_loss:
-            log.info("Daily loss limit (PnL=%.2f).", state["daily_pnl_usd"]); return
-
-        # 6. Cooldowns
+            log.info("Daily loss limit (%.2f).", state["daily_pnl_usd"])
+            return
         if state.get("last_signal_time"):
             try:
                 dt = datetime.fromisoformat(state["last_signal_time"])
                 mins = (now_utc() - dt).total_seconds() / 60
                 cd = get_session_cooldown()
                 if mins < cd:
-                    log.info("Cooldown [%s] (%.0f/%d min).", get_current_session(), mins, cd)
+                    log.info("Cooldown [%s] (%.0f/%d).",
+                             get_current_session(), mins, cd)
                     return
-            except Exception: pass
+            except Exception:
+                pass
         if state.get("last_choppy_time"):
             try:
                 dt = datetime.fromisoformat(state["last_choppy_time"])
                 mins = (now_utc() - dt).total_seconds() / 60
                 if mins < CONFIG.choppy_cooldown_minutes:
-                    log.info("Choppy cooldown (%.0f/%d).", mins, CONFIG.choppy_cooldown_minutes); return
-            except Exception: pass
-
-        # 7. News filter
+                    log.info("Choppy cooldown (%.0f/%d).",
+                             mins, CONFIG.choppy_cooldown_minutes)
+                    return
+            except Exception:
+                pass
         if is_high_impact_news_time():
-            log.info("News window. Standby."); return
+            log.info("News window.")
+            return
 
-        # 8. Fetch data
         try:
-            df = fetch_candles(); df = sanitize_and_trim(df)
-            if df is None: return
+            df = fetch_candles()
+            df = sanitize_and_trim(df)
+            if df is None:
+                return
         except Exception as e:
-            log.error("Fetch: %s", e); return
+            log.error("Fetch: %s", e)
+            return
 
-        # 9. Evaluate active signals
         state = evaluate_active_signals(df, state)
 
-        # 10. H1 confluence (fail-closed)
         h1 = check_h1_trend_confluence()
         if h1 == "UNKNOWN":
             log.info("H1 unavailable — fail-closed.")
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
         log.info("H1: %s | Session: %s", h1, get_current_session())
 
-        # 11. Features
         try:
             df_feat = calculate_features(df)
         except Exception as e:
-            log.error("Features: %s", e); return
-        if len(df_feat) < 100: return
+            log.error("Features: %s", e)
+            return
+        if len(df_feat) < 100:
+            return
 
         last = df_feat.iloc[-1]
-        analyzed_time = last["datetime"].astimezone(CONFIG.wib).strftime("%Y-%m-%d %H:%M WIB")
-        current_price = float(last["close"])
-        log.info("Analyzed: %s | Close: %.2f", analyzed_time, current_price)
+        analyzed_time = last["datetime"].astimezone(
+            CONFIG.wib).strftime("%Y-%m-%d %H:%M WIB")
+        log.info("Analyzed: %s | Close: %.2f",
+                 analyzed_time, float(last["close"]))
 
-        # 12. Regime
-        hurst, entropy = float(last["hurst"]), float(last["shannon_entropy"])
-        log.info("Regime: H=%.3f E=%.3f", hurst, entropy)
+        hurst = float(last["hurst"])
+        entropy = float(last["shannon_entropy"])
         if entropy > CONFIG.max_entropy_threshold or hurst < CONFIG.min_hurst_threshold:
             state["last_choppy_time"] = now_utc().isoformat()
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
-        # 13. Vol regime
         ok, vp = check_vol_regime(df_feat)
         if not ok:
             state["last_choppy_time"] = now_utc().isoformat()
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
-        # 14. Wick
-        rng = float(last["high"] - last["low"]); body = abs(float(last["close"] - last["open"]))
+        rng = float(last["high"] - last["low"])
+        body = abs(float(last["close"] - last["open"]))
         wick = (rng - body) / (rng + 1e-12) if rng > 0 else 1.0
         if wick > CONFIG.max_wick_ratio_threshold:
             state["last_choppy_time"] = now_utc().isoformat()
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
-        # 15. Trend age
-        carr, earr = df_feat["close"].to_numpy(), df_feat["ema_trend"].to_numpy()
-        above = carr[-1] > earr[-1]; age = 0
-        for i in range(len(carr)-1, -1, -1):
-            if (carr[i] > earr[i]) == above: age += 1
-            else: break
+        carr = df_feat["close"].to_numpy()
+        earr = df_feat["ema_trend"].to_numpy()
+        above = carr[-1] > earr[-1]
+        age = 0
+        for i in range(len(carr) - 1, -1, -1):
+            if (carr[i] > earr[i]) == above:
+                age += 1
+            else:
+                break
         if age > CONFIG.max_trend_age_bars:
             state["last_choppy_time"] = now_utc().isoformat()
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
-        # 16. Train
         models = get_or_train_models(df_feat)
         if not models.get("valid"):
             log.info("Model invalid: %s", models.get("reason"))
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
-        # 17. Predict
+        state["last_model_metrics"] = {
+            "meta_auc": round(models.get("meta_auc", 0), 3),
+            "meta_brier": round(models.get("meta_brier", 0), 3),
+            "wf_auc": round(models.get("wf_auc", 0), 3),
+            "wf_prec": round(models.get("wf_prec", 0), 3),
+            "trained_at": now_utc().isoformat(),
+        }
+
         pred = predict_from_models(df_feat.iloc[[-1]], models)
         side = pred.get("side", 0)
         if side == 0:
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
         meta_prob = pred.get("meta_prob", 0.0)
-        pb, ps = pred.get("primary_buy_prob", 0.0), pred.get("primary_sell_prob", 0.0)
+        pb = pred.get("primary_buy_prob", 0.0)
+        ps = pred.get("primary_sell_prob", 0.0)
         th = state["adaptive_threshold"]
         log.info("Prob: B=%.1f%% S=%.1f%% M=%.1f%% T=%.1f%%",
-                 pb*100, ps*100, meta_prob*100, th*100)
-        if meta_prob < CONFIG.meta_min_probability: return
+                 pb * 100, ps * 100, meta_prob * 100, th * 100)
+
+        if meta_prob < CONFIG.meta_min_probability:
+            save_gist_state(state)
+            return
 
         sig = None
-        if side == 1 and pb >= th and h1 in ("BUY", "NEUTRAL"): sig = "BUY"
-        elif side == -1 and ps >= th and h1 in ("SELL", "NEUTRAL"): sig = "SELL"
-        if not sig: return
-        if has_conflicting_signal(state, sig): return
+        if side == 1 and pb >= th and h1 in ("BUY", "NEUTRAL"):
+            sig = "BUY"
+        elif side == -1 and ps >= th and h1 in ("SELL", "NEUTRAL"):
+            sig = "SELL"
+        if not sig:
+            save_gist_state(state)
+            return
+        if has_conflicting_signal(state, sig):
+            save_gist_state(state)
+            return
 
         prob = pb if sig == "BUY" else ps
         trade = compute_trade(sig, df_feat, prob, meta_prob, state)
-        msg = format_message(trade, h1, hurst, entropy, wick, analyzed_time, models)
-
+        msg = format_signal_message(trade, h1, hurst, entropy, wick,
+                                     analyzed_time, models)
         if not send_telegram(msg):
             log.error("Telegram failed — signal cancelled.")
-            save_gist_state(state); return
+            save_gist_state(state)
+            return
 
         state["active_signals"].append(trade)
         state["daily_signals_count"] += 1
@@ -1108,29 +1563,54 @@ def main():
         log.info("✅ %s sent & saved.", sig)
 
 
+# ===========================================================================
+# BACKTEST CLI
+# ===========================================================================
 def run_backtest_cli(days, equity):
     log.info("Backtest %d days, $%.0f", days, equity)
     df = fetch_candles(interval="15m", range_period=f"{days}d")
     if df is None or len(df) < CONFIG.min_train_samples + 500:
-        log.error("Insufficient data."); return
+        log.error("Insufficient data.")
+        return
     df_feat = calculate_features(df)
     log.info("Bars: %d | %s → %s", len(df_feat),
              df_feat["datetime"].iloc[0], df_feat["datetime"].iloc[-1])
     bt = WalkForwardBacktest(df_feat, BacktestConfig(initial_equity=equity))
     report = bt.run()
-    print("\n" + "="*60 + "\nBACKTEST REPORT\n" + "="*60)
+    print("\n" + "=" * 60 + "\nBACKTEST REPORT\n" + "=" * 60)
     print(json.dumps(report, indent=2, default=str))
-    print("="*60)
+    print("=" * 60)
 
 
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="XAUUSD v25.2")
     p.add_argument("--backtest", action="store_true")
     p.add_argument("--days", type=int, default=60)
     p.add_argument("--equity", type=float, default=10000)
+    p.add_argument("--monitor", action="store_true",
+                    help="Force send daily+weekly report")
+    p.add_argument("--monitor-check", action="store_true",
+                    help="Send report if due (08:00 WIB)")
+    p.add_argument("--monitor-dry-run", action="store_true",
+                    help="Print report only, no Telegram")
     a = p.parse_args()
+
     try:
-        run_backtest_cli(a.days, a.equity) if a.backtest else main()
-    except KeyboardInterrupt: log.warning("Interrupted.")
+        if a.backtest:
+            run_backtest_cli(a.days, a.equity)
+        elif a.monitor:
+            run_monitor(force=True)
+        elif a.monitor_dry_run:
+            run_monitor(force=True, dry_run=True)
+        elif a.monitor_check:
+            run_monitor(force=False)
+        else:
+            main()
+    except KeyboardInterrupt:
+        log.warning("Interrupted.")
     except Exception as e:
-        log.critical("Fatal: %s", e, exc_info=True); sys.exit(1)
+        log.critical("Fatal: %s", e, exc_info=True)
+        sys.exit(1)
