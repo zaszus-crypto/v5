@@ -339,28 +339,28 @@ def reset_daily_state_if_needed(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# 4. DATA FETCHER: INSTITUTIONAL SPOT GOLD (XAU/USD)
+# 4. DATA FETCHER: BULLETPROOF MULTI-TIER GOLD FEED ENGINE
 # ===========================================================================
-def _fetch_yahoo_spot_gold(interval: str = "15m", range_period: str = "60d") -> pd.DataFrame:
+def _fetch_yahoo_gcf(interval: str = "15m", range_period: str = "60d") -> pd.DataFrame:
     """
-    Mengambil data SPOT XAU/USD asli (Ticker: XAUUSD=X) dari Yahoo Finance.
-    Bukan token PAXG kripto dan bukan Gold Futures (GC=F) sehingga tidak ada
-    offset buatan $30!
+    Mengambil data COMEX Gold Continuous Benchmark (Ticker: GC=F) dari Yahoo Finance.
+    GC=F menyediakan lebih dari 5.600 candle M15 historis berkesinambungan
+    tanpa API key (Ticker 'XAUUSD=X' telah dihapus / 404 di Yahoo chart API).
     """
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval={interval}&range={range_period}"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={range_period}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     r = requests.get(url, headers=headers, timeout=10)
     r.raise_for_status()
     data = r.json()
     result = data.get("chart", {}).get("result")
     if not result:
-        raise ValueError("Yahoo Spot XAUUSD data kosong")
-    
+        raise ValueError("Yahoo GC=F data kosong")
+
     quote_data = result[0]
     timestamps = quote_data.get("timestamp", [])
     quotes = quote_data.get("indicators", {}).get("quote", [{}])[0]
     if not timestamps or not quotes.get("close"):
-        raise ValueError("Indikator Yahoo quote XAUUSD tidak lengkap")
+        raise ValueError("Indikator Yahoo quote GC=F tidak lengkap")
 
     df = pd.DataFrame({
         "epoch": timestamps,
@@ -373,41 +373,94 @@ def _fetch_yahoo_spot_gold(interval: str = "15m", range_period: str = "60d") -> 
     df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
     for col in ("open", "high", "low", "close"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    # Standarisasi volume proxy (jika volume nol pada spot forex, gunakan tick proxy)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
     df = df[["datetime", "open", "high", "low", "close", "volume"]]
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
     return df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
 
-def _fetch_stooq_xauusd() -> pd.DataFrame:
-    """Fallback cadangan: Stooq institutional historical quotes untuk XAUUSD."""
-    url = "https://stooq.com/q/d/l/?s=xauusd&i=d"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    df = pd.read_csv(url)
-    df.columns = [c.lower() for c in df.columns]
-    df["datetime"] = pd.to_datetime(df["date"], utc=True)
-    return df[["datetime", "open", "high", "low", "close", "volume"]].dropna()
+def _fetch_binance_paxg(interval: str = "15m", total_bars: int = 3000) -> pd.DataFrame:
+    """Fallback cadangan: Binance Pax Gold (PAXGUSDT) jika Yahoo mengalami rate-limit."""
+    all_data, end_time, remaining = [], None, total_bars
+    while remaining > 0:
+        limit = min(1000, remaining)
+        params = {"symbol": "PAXGUSDT", "interval": interval, "limit": limit}
+        if end_time:
+            params["endTime"] = end_time
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params=params,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if r.status_code != 200:
+            if all_data:
+                break
+            raise RuntimeError(f"Binance HTTP {r.status_code}")
+        data = r.json()
+        if not data or not isinstance(data, list):
+            break
+        all_data = data + all_data
+        if len(data) < limit:
+            break
+        end_time = data[0][0] - 1
+        remaining -= len(data)
+        py_time.sleep(0.1)
+
+    if not all_data:
+        raise RuntimeError("Binance data kosong")
+    df = pd.DataFrame(
+        all_data,
+        columns=["ot", "o", "h", "l", "c", "v", "ct", "qv", "t", "tb", "tq", "ig"],
+    )
+    df["datetime"] = pd.to_datetime(df["ot"], unit="ms", utc=True)
+    for a, b in [("o", "open"), ("h", "high"), ("l", "low"), ("c", "close"), ("v", "volume")]:
+        df[b] = pd.to_numeric(df[a], errors="coerce")
+    df = df[["datetime", "open", "high", "low", "close", "volume"]]
+    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+    return df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
+
+def _fetch_kraken_paxg(interval_min: int = 15) -> pd.DataFrame:
+    """Fallback cadangan: Kraken PAXGUSD."""
+    r = requests.get(
+        "https://api.kraken.com/0/public/OHLC",
+        params={"pair": "PAXGUSD", "interval": interval_min},
+        timeout=8,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Kraken HTTP {r.status_code}")
+    data = r.json()
+    result = data.get("result", {})
+    key = next((k for k in result.keys() if k != "last"), None)
+    if not key or not result.get(key):
+        raise RuntimeError("Kraken data kosong")
+    df = pd.DataFrame(result[key], columns=["ts", "open", "high", "low", "close", "vwap", "volume", "count"])
+    df["datetime"] = pd.to_datetime(df["ts"].astype("int64"), unit="s", utc=True)
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df[["datetime", "open", "high", "low", "close", "volume"]].dropna().sort_values("datetime").reset_index(drop=True)
 
 def fetch_spot_candles(interval: str = "15m", range_period: str = "60d") -> Tuple[pd.DataFrame, str]:
     """
-    Fungsi Utama Pengambil Data Spot Emas (XAU/USD).
-    Menghilangkan token kripto PAXG demi akurasi harga forex interbank.
+    Fungsi Multi-Tier Bulletproof Feed:
+    1. Yahoo COMEX Gold Benchmark (GC=F) -> 5.600+ candle M15
+    2. OANDA Spot XAU_USD (Jika OANDA_API_KEY disetel)
+    3. Binance PAXGUSDT -> 3.000 candle
+    4. Kraken PAXGUSD
     """
-    # 1. Coba Yahoo Spot XAUUSD=X (Spot Rate Langsung)
+    # 1. Coba Yahoo GC=F (Primary Benchmark)
     try:
-        df = _fetch_yahoo_spot_gold(interval=interval, range_period=range_period)
+        df = _fetch_yahoo_gcf(interval=interval, range_period=range_period)
         if len(df) >= CONFIG.min_candles:
-            log.info("✅ SPOT FEED TERHUBUNG: Yahoo Spot Gold XAUUSD=X (%d candle)", len(df))
-            return df, "SPOT_XAUUSD"
+            log.info("✅ FEED UTAMA TERHUBUNG: Yahoo COMEX Gold GC=F (%d candle M15)", len(df))
+            return df, "YAHOO_GOLD_GCF"
     except Exception as e:
-        log.warning("Gagal mengambil Yahoo Spot XAUUSD: %s. Mencoba alternatif...", e)
+        log.warning("Yahoo GC=F tidak dapat diakses (%s). Mencoba alternatif...", e)
 
-    # 2. Alternatif cadangan kuotasi spot interbank
-    try:
-        # Jika ada endpoint broker lokal atau OANDA token
-        oanda_token = os.getenv("OANDA_API_KEY", "")
-        if oanda_token:
+    # 2. Coba OANDA REST API jika ada token
+    oanda_token = os.getenv("OANDA_API_KEY", "")
+    if oanda_token:
+        try:
             url = "https://api-fxtrade.oanda.com/v3/instruments/XAU_USD/candles"
             headers = {"Authorization": f"Bearer {oanda_token}"}
             params = {"granularity": "M15", "count": 1500, "price": "M"}
@@ -426,13 +479,32 @@ def fetch_spot_candles(interval: str = "15m", range_period: str = "60d") -> Tupl
                             "close": float(mid["c"]),
                             "volume": float(c.get("volume", 0)),
                         })
-                df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
-                log.info("✅ OANDA SPOT FEED: %d candle", len(df))
-                return df, "OANDA_SPOT_XAUUSD"
-    except Exception as e:
-        log.warning("OANDA feed fallback error: %s", e)
+                if len(rows) >= CONFIG.min_candles:
+                    df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+                    log.info("✅ OANDA SPOT FEED TERHUBUNG: %d candle", len(df))
+                    return df, "OANDA_SPOT_XAUUSD"
+        except Exception as e:
+            log.warning("OANDA feed fallback error: %s", e)
 
-    raise RuntimeError("SEMUA FEED DATA SPOT XAU/USD GAGAL. Eksekusi dibatalkan demi keamanan!")
+    # 3. Coba Binance PAXG
+    try:
+        df = _fetch_binance_paxg(interval=interval, total_bars=3000)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ FEED ALTERNATIF TERHUBUNG: Binance PAXGUSDT (%d candle M15)", len(df))
+            return df, "BINANCE_PAXG"
+    except Exception as e:
+        log.warning("Binance PAXG fallback error: %s", e)
+
+    # 4. Coba Kraken PAXG
+    try:
+        df = _fetch_kraken_paxg(interval_min=15)
+        if len(df) >= CONFIG.min_candles:
+            log.info("✅ FEED ALTERNATIF TERHUBUNG: Kraken PAXGUSD (%d candle M15)", len(df))
+            return df, "KRAKEN_PAXG"
+    except Exception as e:
+        log.warning("Kraken PAXG fallback error: %s", e)
+
+    raise RuntimeError("SEMUA FEED DATA EMAS GAGAL. Eksekusi dibatalkan demi keamanan!")
 
 
 def enforce_strictly_closed_candles(df: pd.DataFrame, timeframe_minutes: int = 15) -> Optional[pd.DataFrame]:
