@@ -1,9 +1,9 @@
-name: XAUUSD Bot v25.3
+name: XAUUSD Bot v25.4
 
 on:
   schedule:
-    - cron: '*/30 * * * 1-5'      # Main bot
-    - cron: '0 */6 * * 1-5'        # Healthcheck
+    - cron: '*/30 * * * 1-5'
+    - cron: '0 1,7,13,19 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
@@ -38,8 +38,8 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: .cache/model.pkl
-          key: xauusd-v253-${{ github.run_id }}
-          restore-keys: xauusd-v253-
+          key: xauusd-v254-${{ github.run_id }}
+          restore-keys: xauusd-v254-
       - run: mkdir -p .cache
 
       - name: Run bot
@@ -69,7 +69,7 @@ jobs:
       - name: Healthcheck
         if: |
           always() &&
-          (github.event.schedule == '0 */6 * * 1-5' ||
+          (github.event.schedule == '0 1,7,13,19 * * 1-5' ||
            github.event.inputs.mode == 'healthcheck')
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -89,7 +89,7 @@ jobs:
         run: |
           python bot.py --backtest --days "${{ github.event.inputs.days || '60' }}" --equity "${{ github.event.inputs.equity || '10000' }}"
 
-      - name: Monitor (force)
+      - name: Monitor force
         if: github.event.inputs.mode == 'monitor'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -98,7 +98,7 @@ jobs:
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
         run: python bot.py --monitor
 
-      - name: Monitor (dry-run)
+      - name: Monitor dry-run
         if: github.event.inputs.mode == 'monitor-dry-run'
         env:
           GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
@@ -120,4 +120,4 @@ jobs:
         if: always()
         with:
           path: .cache/model.pkl
-          key: xauusd-v253-${{ github.run_id }}
+          key: xauusd-v254-${{ github.run_id }}
