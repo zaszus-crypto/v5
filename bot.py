@@ -245,7 +245,7 @@ def load_gist_state():
     try:
         r = requests.get(f"https://api.github.com/gists/{CONFIG.gist_id}",
                           headers={"Authorization": f"token {CONFIG.gist_token}"},
-                          timeout=15)
+                          timeout=8)
         if r.status_code == 200:
             for fn, fc in r.json().get("files", {}).items():
                 if fn.endswith("bot_state.json"):
@@ -263,7 +263,7 @@ def save_gist_state(state, retries=3):
     for attempt in range(1, retries + 1):
         try:
             r = requests.patch(f"https://api.github.com/gists/{CONFIG.gist_id}",
-                                json=payload, headers=headers, timeout=15)
+                                json=payload, headers=headers, timeout=8)
             if r.status_code == 200: return True
         except Exception as e:
             log.warning("Gist save error: %s", e)
@@ -397,7 +397,7 @@ def send_telegram(message):
                "parse_mode": "HTML", "disable_web_page_preview": True}
     for attempt in range(1, 4):
         try:
-            r = requests.post(url, json=payload, timeout=10)
+            r = requests.post(url, json=payload, timeout=8)
             if r.status_code == 200: return True
             if r.status_code == 429:
                 py_time.sleep(int(r.json().get("parameters", {}).get("retry_after", 5)) + 1)
@@ -419,7 +419,7 @@ def _fetch_binance_paginated(symbol="PAXGUSDT", interval="15m", total_bars=5000)
         if end_time: params["endTime"] = end_time
         try:
             r = requests.get("https://api.binance.com/api/v3/klines",
-                              params=params, timeout=15,
+                              params=params, timeout=8,
                               headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code != 200:
                 if all_data: break
@@ -449,7 +449,7 @@ def _fetch_kraken(interval_min=15):
     try:
         r = requests.get("https://api.kraken.com/0/public/OHLC",
                           params={"pair": "PAXGUSD", "interval": interval_min},
-                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                          timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
         data = r.json()
         if data.get("error"): raise RuntimeError(f"API: {data['error']}")
@@ -472,7 +472,7 @@ def _fetch_coinbase(interval_sec=900):
     try:
         r = requests.get("https://api.exchange.coinbase.com/products/PAXG-USD/candles",
                           params={"granularity": interval_sec},
-                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                          timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
         data = r.json()
         if not data or not isinstance(data, list): raise RuntimeError("empty")
@@ -491,7 +491,7 @@ def _fetch_bybit(interval="15", limit=200):
         r = requests.get("https://api.bybit.com/v5/market/kline",
                           params={"category":"spot","symbol":"PAXGUSDT",
                                   "interval":interval,"limit":limit},
-                          timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                          timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200: raise RuntimeError(f"HTTP {r.status_code}")
         data = r.json()
         if data.get("retCode") != 0: raise RuntimeError(f"API: {data.get('retMsg')}")
@@ -519,7 +519,7 @@ def _fetch_deriv(granularity_sec, count=2500):
                    "granularity": granularity_sec, "style": "candles"}
         ws = None
         try:
-            ws = websocket.create_connection(url, timeout=15,
+            ws = websocket.create_connection(url, timeout=8,
                                               enable_multithread=True,
                                               header={"User-Agent": "Mozilla/5.0"})
             ws.send(json.dumps(payload))
@@ -548,7 +548,7 @@ def _fetch_yahoo_gcf(interval="15m", range_period="60d"):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     for attempt in range(1, 4):
         try:
-            r = requests.get(url, headers=headers, timeout=20)
+            r = requests.get(url, headers=headers, timeout=10)
             r.raise_for_status()
             data = r.json()
             result = data.get("chart", {}).get("result")
@@ -584,7 +584,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     gran_map = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400}
     gran = gran_map.get(interval, 900)
 
-    # 1. Binance PAXG (best)
     try:
         df = _fetch_binance_paginated("PAXGUSDT", binance_iv, 5000)
         if len(df) >= CONFIG.min_candles:
@@ -593,7 +592,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     except Exception as e:
         log.warning("Binance PAXG failed: %s", e)
 
-    # 2. Kraken
     try:
         df = _fetch_kraken(kraken_iv)
         if len(df) >= CONFIG.min_candles:
@@ -602,7 +600,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     except Exception as e:
         log.warning("Kraken failed: %s", e)
 
-    # 3. Coinbase
     try:
         df = _fetch_coinbase(coinbase_iv)
         if len(df) >= CONFIG.min_candles:
@@ -611,7 +608,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     except Exception as e:
         log.warning("Coinbase failed: %s", e)
 
-    # 4. Bybit
     try:
         df = _fetch_bybit(bybit_iv, 200)
         if len(df) >= CONFIG.min_candles:
@@ -620,7 +616,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     except Exception as e:
         log.warning("Bybit failed: %s", e)
 
-    # 5. Deriv (may fail from datacenter)
     try:
         df = _fetch_deriv(gran, 2500)
         if len(df) >= CONFIG.min_candles:
@@ -629,7 +624,6 @@ def fetch_candles(interval="15m", range_period="60d"):
     except Exception as e:
         log.warning("Deriv failed: %s", e)
 
-    # 6. Yahoo GC=F (last resort)
     try:
         df = _fetch_yahoo_gcf(interval, range_period)
         log.critical("⚠️ YAHOO_FUTURES fallback — offset $%.2f may be off", CONFIG.price_offset)
@@ -1435,13 +1429,15 @@ def main():
                 if mins < get_session_cooldown():
                     log.info("Cooldown (%.0f).", mins); return
             except Exception: pass
-               if state.get("last_choppy_time"):
+        
+        if state.get("last_choppy_time"):
             try:
                 mins = (now_utc() - datetime.fromisoformat(state["last_choppy_time"])).total_seconds()/60
                 if mins < CONFIG.choppy_cooldown_minutes:
                     log.info("Choppy cooldown (%.0f/%d min).", mins, CONFIG.choppy_cooldown_minutes)
                     return
             except Exception: pass
+
         if is_high_impact_news_time():
             log.info("News window."); return
 
